@@ -14,7 +14,10 @@ DEFAULT_RUNS = OrderedDict(
         ("no_memory", Path("outputs/train_nomemory_real_movia_subset50_v4")),
         ("memory_baseline", Path("outputs/train_memory_real_movia_subset50_v1")),
         ("memory_strengthened", Path("outputs/train_memory_real_movia_subset50_v3")),
-        ("uncertainty_writes", Path("outputs/train_memory_uncertainty_real_movia_subset50_v1")),
+        ("memory_uncertainty_convgru", Path("outputs/train_memory_uncertainty_real_movia_subset50_v1")),
+        ("diffusion_no_memory", Path("outputs/train_diffusion_nomemory_real_movia_subset50_v1")),
+        ("diffusion_memory", Path("outputs/train_diffusion_memory_real_movia_subset50_v1")),
+        ("diffusion_memory_uncertainty", Path("outputs/train_diffusion_memory_uncertainty_real_movia_subset50_v1")),
     ]
 )
 
@@ -123,6 +126,8 @@ def collect_run_summary(label: str, run_dir: Path, rollout_name: str) -> dict[st
             "final_model_dynamic_l1": to_float(get_nested(metrics, "final_val", "model_dynamic_l1")),
             "final_model_memory_covered_l1": to_float(get_nested(metrics, "final_val", "model_memory_covered_l1")),
             "final_model_psnr": to_float(get_nested(metrics, "final_val", "model_psnr")),
+            "final_uncertainty_error_corr": to_float(get_nested(metrics, "final_val", "uncertainty_error_corr")),
+            "final_write_coverage": to_float(get_nested(metrics, "final_val", "write_coverage")),
             "final_baseline_l1": to_float(get_nested(metrics, "final_val", "baseline_l1")),
             "final_baseline_dynamic_l1": to_float(get_nested(metrics, "final_val", "baseline_dynamic_l1")),
             "final_baseline_memory_covered_l1": to_float(get_nested(metrics, "final_val", "baseline_memory_covered_l1")),
@@ -136,6 +141,8 @@ def collect_run_summary(label: str, run_dir: Path, rollout_name: str) -> dict[st
             "rollout_model_dynamic_l1": to_float(rollout.get("model_dynamic_l1")),
             "rollout_model_memory_covered_l1": to_float(rollout.get("model_memory_covered_l1")),
             "rollout_model_psnr": to_float(rollout.get("model_psnr")),
+            "rollout_uncertainty_error_corr": to_float(rollout.get("uncertainty_error_corr")),
+            "rollout_write_coverage": to_float(rollout.get("write_coverage")),
             "rollout_baseline_l1": to_float(rollout.get("baseline_l1")),
             "rollout_baseline_dynamic_l1": to_float(rollout.get("baseline_dynamic_l1")),
             "rollout_baseline_memory_covered_l1": to_float(rollout.get("baseline_memory_covered_l1")),
@@ -170,6 +177,8 @@ def build_validation_rows(summaries: list[dict[str, Any]]) -> list[list[str]]:
                 format_value(delta(summary.get("final_model_memory_covered_l1"), summary.get("final_baseline_memory_covered_l1"))),
                 format_value(summary.get("final_model_psnr")),
                 format_value(summary.get("final_memory_coverage")),
+                format_value(summary.get("final_uncertainty_error_corr")),
+                format_value(summary.get("final_write_coverage")),
                 format_value(summary.get("beats_baseline_dynamic_l1")),
                 format_value(summary.get("beats_baseline_memory_covered_l1")),
             ]
@@ -192,6 +201,8 @@ def build_rollout_rows(summaries: list[dict[str, Any]]) -> list[list[str]]:
                 format_value(delta(summary.get("rollout_model_memory_covered_l1"), summary.get("rollout_baseline_memory_covered_l1"))),
                 format_value(summary.get("rollout_model_psnr")),
                 format_value(summary.get("rollout_memory_coverage")),
+                format_value(summary.get("rollout_uncertainty_error_corr")),
+                format_value(summary.get("rollout_write_coverage")),
             ]
         )
     return rows
@@ -231,6 +242,8 @@ def write_outputs(output_dir: Path, summaries: list[dict[str, Any]], rollout_nam
         "mem_cov_delta_vs_copy_last",
         "val_psnr",
         "memory_cov",
+        "unc_corr",
+        "write_cov",
         "beats_dyn",
         "beats_mem_cov",
     ]
@@ -245,6 +258,8 @@ def write_outputs(output_dir: Path, summaries: list[dict[str, Any]], rollout_nam
         "mem_cov_delta_vs_copy_last",
         "rollout_psnr",
         "memory_cov",
+        "unc_corr",
+        "write_cov",
     ]
     reference_headers = [
         "comparison",

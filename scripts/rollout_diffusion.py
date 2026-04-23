@@ -11,26 +11,29 @@ from PIL import Image
 
 from world_model.data.clip_dataset import MemoryConditionedClipWindowDataset
 from world_model.eval.metrics_image import masked_l1, motion_mask_from_last_context, psnr
-from world_model.inference.uncertainty_rollout import rollout_convgru_uncertainty
-from world_model.models.world_model import MemoryConditionedWorldModel
+from world_model.inference.uncertainty_rollout import rollout_diffusion_uncertainty
+from world_model.models.diffusion import ConditionalVideoDiffusion
 from world_model.uncertainty.calibration import high_error_auroc, uncertainty_error_correlation
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a trained persistent-memory model on a single exported clip window.")
+    parser = argparse.ArgumentParser(description="Run a trained diffusion model on a single exported clip window.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--clip", type=Path, required=True)
     parser.add_argument("--start-frame", type=int, default=0)
-    parser.add_argument("--context-frames", type=int, default=4)
-    parser.add_argument("--predict-frames", type=int, default=4)
-    parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--hidden-channels", type=int, default=96)
+    parser.add_argument("--context-frames", type=int, default=None)
+    parser.add_argument("--predict-frames", type=int, default=None)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--model-channels", type=int, default=None)
+    parser.add_argument("--diffusion-steps", type=int, default=None)
+    parser.add_argument("--sample-steps", type=int, default=None)
+    parser.add_argument("--enable-uncertainty", action="store_true")
+    parser.add_argument("--uncertainty-samples", type=int, default=4)
+    parser.add_argument("--write-confidence-threshold", type=float, default=0.55)
     parser.add_argument("--motion-threshold", type=float, default=0.03)
     parser.add_argument("--memory-grid-resolution", type=int, nargs=3, default=(48, 40, 48))
     parser.add_argument("--memory-stride", type=int, default=1)
     parser.add_argument("--memory-splat-radius", type=int, default=1)
-    parser.add_argument("--enable-uncertainty", action="store_true")
-    parser.add_argument("--write-confidence-threshold", type=float, default=0.55)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
@@ -109,75 +112,97 @@ def save_comparison(
 def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
+
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_state" not in checkpoint or "config" not in checkpoint:
+        raise ValueError("Expected a diffusion checkpoint with 'model_state' and 'config'")
+    config = checkpoint["config"]
+    variant = config["variant"]
+    context_frames = args.context_frames or int(config["context_frames"])
+    predict_frames = args.predict_frames or int(config["predict_frames"])
+    image_size = args.image_size or int(config["image_size"])
+    model_channels = args.model_channels or int(config["model_channels"])
+    diffusion_steps = args.diffusion_steps or int(config["diffusion_steps"])
+    sample_steps = args.sample_steps or int(config.get("sample_steps_eval", 16))
+
+    model = ConditionalVideoDiffusion(
+        context_frames=context_frames,
+        predict_frames=predict_frames,
+        variant=variant,
+        model_channels=model_channels,
+        diffusion_steps=diffusion_steps,
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+
     dataset = MemoryConditionedClipWindowDataset(
         clip_paths=[args.clip],
-        context_frames=args.context_frames,
-        predict_frames=args.predict_frames,
-        image_size=args.image_size,
+        context_frames=context_frames,
+        predict_frames=predict_frames,
+        image_size=image_size,
         memory_grid_resolution=tuple(args.memory_grid_resolution),
         memory_stride=args.memory_stride,
         memory_splat_radius=args.memory_splat_radius,
     )
     sample = dataset[args.start_frame]
 
-    model = MemoryConditionedWorldModel(hidden_channels=args.hidden_channels, enable_uncertainty=args.enable_uncertainty).to(device)
-    state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
-    model.eval()
-
     if args.enable_uncertainty:
-        rollout = rollout_convgru_uncertainty(
+        rollout = rollout_diffusion_uncertainty(
             model=model,
             clip_path=args.clip,
             start_frame=args.start_frame,
-            context_frames=args.context_frames,
-            predict_frames=args.predict_frames,
-            image_size=args.image_size,
+            context_frames=context_frames,
+            predict_frames=predict_frames,
+            image_size=image_size,
             device=device,
             memory_grid_resolution=tuple(args.memory_grid_resolution),
             memory_stride=args.memory_stride,
             memory_splat_radius=args.memory_splat_radius,
             confidence_threshold=args.write_confidence_threshold,
+            sample_steps=sample_steps,
+            uncertainty_samples=args.uncertainty_samples,
         )
         window = rollout["window"]
         context_rgb = window.context_rgb.to(device)
         target_rgb = window.target_rgb.to(device)
-        target_depth = window.target_depth.to(device)
-        pred_rgb = rollout["prediction"].unsqueeze(0).to(device)
-        pred_depth = rollout["pred_depth"].unsqueeze(0).to(device)
+        prediction = rollout["prediction"].unsqueeze(0).to(device)
         uncertainty = rollout["uncertainty"].unsqueeze(0).to(device)
         confidence = rollout["confidence"].unsqueeze(0).to(device)
         write_mask = rollout["write_mask"].unsqueeze(0).to(device)
         memory_render_rgb = rollout["memory_render_rgb"]
         memory_render_mask = rollout["memory_render_mask"]
-        memory_mask = memory_render_mask.unsqueeze(0).to(device)
+        intermediates = []
     else:
         context_rgb = sample["context_rgb"].unsqueeze(0).to(device)
         target_rgb = sample["target_rgb"].unsqueeze(0).to(device)
         context_poses = sample["context_poses"].unsqueeze(0).to(device)
         target_poses = sample["target_poses"].unsqueeze(0).to(device)
-        target_depth = sample["target_depth"].unsqueeze(0).to(device)
         memory_condition = sample["memory_condition"].unsqueeze(0).to(device)
         with torch.no_grad():
-            model_outputs = model(context_rgb, context_poses, target_poses, memory_condition)
-        pred_rgb, pred_depth = model_outputs[:2]
+            prediction, intermediates = model.sample(
+                context_rgb=context_rgb,
+                context_poses=context_poses,
+                target_poses=target_poses,
+                memory_condition=memory_condition if variant == "memory" else None,
+                sample_steps=sample_steps,
+                eta=0.0,
+                return_intermediates=True,
+            )
         uncertainty = None
         confidence = None
         write_mask = None
         memory_render_rgb = sample["memory_render_rgb"]
         memory_render_mask = sample["memory_render_mask"]
-        memory_mask = sample["memory_render_mask"].unsqueeze(0).to(device)
 
-    baseline = context_rgb[:, -1:].repeat(1, args.predict_frames, 1, 1, 1)
+    baseline = context_rgb[:, -1:].repeat(1, predict_frames, 1, 1, 1)
     dynamic_mask = motion_mask_from_last_context(context_rgb, target_rgb, threshold=args.motion_threshold)
-    depth_mask = (target_depth > 0.0).to(dtype=pred_depth.dtype)
+    memory_mask = memory_render_mask.unsqueeze(0).to(device)
 
     metrics = {
-        "model_l1": float(masked_l1(pred_rgb, target_rgb)),
-        "model_psnr": float(psnr(pred_rgb, target_rgb)),
-        "model_dynamic_l1": float(masked_l1(pred_rgb, target_rgb, dynamic_mask)),
-        "model_depth_l1": float(masked_l1(pred_depth, target_depth, depth_mask)),
-        "model_memory_covered_l1": float(masked_l1(pred_rgb, target_rgb, memory_mask)),
+        "model_l1": float(masked_l1(prediction, target_rgb)),
+        "model_psnr": float(psnr(prediction, target_rgb)),
+        "model_dynamic_l1": float(masked_l1(prediction, target_rgb, dynamic_mask)),
+        "model_memory_covered_l1": float(masked_l1(prediction, target_rgb, memory_mask)),
         "baseline_l1": float(masked_l1(baseline, target_rgb)),
         "baseline_psnr": float(psnr(baseline, target_rgb)),
         "baseline_dynamic_l1": float(masked_l1(baseline, target_rgb, dynamic_mask)),
@@ -188,23 +213,26 @@ def main() -> None:
         "memory_render_l1_covered": float(masked_l1(memory_render_rgb.unsqueeze(0).to(device), target_rgb, memory_mask)),
         "clip_path": str(args.clip),
         "start_frame": args.start_frame,
-        "variant": "memory_uncertainty_convgru" if args.enable_uncertainty else "memory",
+        "variant": "diffusion_memory_uncertainty" if args.enable_uncertainty else variant,
+        "model_type": "diffusion",
+        "sample_steps": sample_steps,
     }
     if uncertainty is not None:
-        error_map = (pred_rgb - target_rgb).abs().mean(dim=2, keepdim=True)
+        error_map = (prediction - target_rgb).abs().mean(dim=2, keepdim=True)
         metrics.update(
             {
                 "uncertainty_error_corr": float(uncertainty_error_correlation(uncertainty, error_map, mask=memory_mask)),
                 "high_error_auroc": float(high_error_auroc(uncertainty, error_map, mask=memory_mask)),
                 "write_coverage": float(write_mask.mean()),
                 "confidence_mean": float(confidence.mean()),
+                "uncertainty_samples": args.uncertainty_samples,
             }
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     save_strip(list(context_rgb[0].cpu()), args.output_dir / "context_strip.png")
     save_strip(list(target_rgb[0].cpu()), args.output_dir / "target_strip.png")
-    save_strip(list(pred_rgb[0].cpu()), args.output_dir / "prediction_strip.png")
+    save_strip(list(prediction[0].cpu()), args.output_dir / "prediction_strip.png")
     save_strip(list(baseline[0].cpu()), args.output_dir / "baseline_strip.png")
     save_strip(list(memory_render_rgb), args.output_dir / "memory_render_strip.png")
     save_mask_strip(list(dynamic_mask[0].cpu()), args.output_dir / "motion_mask_strip.png")
@@ -213,7 +241,10 @@ def main() -> None:
         save_scalar_strip(list(uncertainty[0].cpu()), args.output_dir / "uncertainty_strip.png")
         save_scalar_strip(list(confidence[0].cpu()), args.output_dir / "confidence_strip.png")
         save_mask_strip(list(write_mask[0].cpu()), args.output_dir / "write_mask_strip.png")
-    save_comparison(context_rgb[0].cpu(), target_rgb[0].cpu(), pred_rgb[0].cpu(), baseline[0].cpu(), args.output_dir / "comparison.png")
+    save_comparison(context_rgb[0].cpu(), target_rgb[0].cpu(), prediction[0].cpu(), baseline[0].cpu(), args.output_dir / "comparison.png")
+    if intermediates:
+        denoise_frames = [step[0, 0].cpu() for step in intermediates]
+        save_strip(denoise_frames, args.output_dir / "denoising_first_frame_strip.png")
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(json.dumps(metrics, indent=2))
     print(f"saved rollout artifacts to {args.output_dir}")

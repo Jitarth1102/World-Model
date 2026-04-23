@@ -19,8 +19,11 @@ from world_model.eval.benchmark_slices import (
 )
 from world_model.eval.metrics_image import masked_l1, motion_mask_from_last_context, psnr
 from world_model.eval.metrics_memory import baseline_advantage, memory_covered_l1, oracle_alignment_l1
+from world_model.inference.uncertainty_rollout import rollout_convgru_uncertainty, rollout_diffusion_uncertainty
 from world_model.models.convgru_predictor import NoMemoryPredictor
+from world_model.models.diffusion import ConditionalVideoDiffusion
 from world_model.models.world_model import MemoryConditionedWorldModel
+from world_model.uncertainty.calibration import high_error_auroc, uncertainty_error_correlation
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,9 @@ class EvalRunSpec:
     run_dir: Path
     checkpoint_path: Path
     hidden_channels: int
+    model_channels: int | None = None
+    diffusion_steps: int | None = None
+    sample_steps_eval: int | None = None
     status: str = "ok"
 
 
@@ -64,18 +70,46 @@ def _infer_hidden_channels(run_dir: Path, default: int = 96) -> int:
     return int(payload.get("hidden_channels", default))
 
 
+def _infer_diffusion_config(run_dir: Path) -> tuple[int, int, int]:
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        return 32, 64, 25
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    return (
+        int(payload.get("model_channels", 32)),
+        int(payload.get("diffusion_steps", 64)),
+        int(payload.get("sample_steps_eval", 25)),
+    )
+
+
+def _load_run_metrics_payload(run_dir: Path) -> dict[str, Any]:
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        return {}
+    return json.loads(metrics_path.read_text(encoding="utf-8"))
+
+
 def resolve_run_specs(
     default_runs: OrderedDict[str, tuple[str, Path]],
     checkpoint_kind: str = "last",
 ) -> list[EvalRunSpec]:
     specs: list[EvalRunSpec] = []
     for label, (variant, run_dir) in default_runs.items():
+        model_channels = None
+        diffusion_steps = None
+        sample_steps_eval = None
         if variant == "no_memory":
             preferred = run_dir / f"nomemory_model_{checkpoint_kind}.pt"
             fallback = run_dir / "nomemory_model_best.pt"
-        else:
+        elif variant in {"memory", "memory_uncertainty_convgru"}:
             preferred = run_dir / f"memory_model_{checkpoint_kind}.pt"
             fallback = run_dir / "memory_model_best.pt"
+        elif variant in {"diffusion_no_memory", "diffusion_memory", "diffusion_memory_uncertainty"}:
+            preferred = run_dir / f"diffusion_model_{checkpoint_kind}.pt"
+            fallback = run_dir / "diffusion_model_best.pt"
+            model_channels, diffusion_steps, sample_steps_eval = _infer_diffusion_config(run_dir)
+        else:
+            raise ValueError(f"Unsupported evaluation variant: {variant}")
         checkpoint_path = preferred if preferred.exists() else fallback
         status = "ok" if checkpoint_path.exists() else "missing"
         specs.append(
@@ -85,6 +119,9 @@ def resolve_run_specs(
                 run_dir=run_dir,
                 checkpoint_path=checkpoint_path,
                 hidden_channels=_infer_hidden_channels(run_dir),
+                model_channels=model_channels,
+                diffusion_steps=diffusion_steps,
+                sample_steps_eval=sample_steps_eval,
                 status=status,
             )
         )
@@ -123,9 +160,26 @@ def _load_model(spec: EvalRunSpec, device: torch.device) -> torch.nn.Module | No
         return None
     if spec.variant == "no_memory":
         model: torch.nn.Module = NoMemoryPredictor(hidden_channels=spec.hidden_channels).to(device)
+        state_dict = torch.load(spec.checkpoint_path, map_location=device)
+    elif spec.variant in {"memory", "memory_uncertainty_convgru"}:
+        model = MemoryConditionedWorldModel(
+            hidden_channels=spec.hidden_channels,
+            enable_uncertainty=(spec.variant == "memory_uncertainty_convgru"),
+        ).to(device)
+        state_dict = torch.load(spec.checkpoint_path, map_location=device)
+    elif spec.variant in {"diffusion_no_memory", "diffusion_memory", "diffusion_memory_uncertainty"}:
+        checkpoint = torch.load(spec.checkpoint_path, map_location=device)
+        config = checkpoint["config"]
+        model = ConditionalVideoDiffusion(
+            context_frames=int(config["context_frames"]),
+            predict_frames=int(config["predict_frames"]),
+            variant=str(config["variant"]),
+            model_channels=int(config["model_channels"]),
+            diffusion_steps=int(config["diffusion_steps"]),
+        ).to(device)
+        state_dict = checkpoint["model_state"]
     else:
-        model = MemoryConditionedWorldModel(hidden_channels=spec.hidden_channels).to(device)
-    state_dict = torch.load(spec.checkpoint_path, map_location=device)
+        raise ValueError(f"Unsupported evaluation variant: {spec.variant}")
     model.load_state_dict(state_dict)
     model.eval()
     return model
@@ -138,8 +192,21 @@ def _predict(spec: EvalRunSpec, model: torch.nn.Module, sample: dict[str, Any]) 
     if spec.variant == "no_memory":
         pred_rgb = model(context_rgb, context_poses, target_poses)
         return pred_rgb, None
-    pred_rgb, pred_depth = model(context_rgb, context_poses, target_poses, sample["memory_condition"])
-    return pred_rgb, pred_depth
+    if spec.variant == "memory":
+        pred_rgb, pred_depth = model(context_rgb, context_poses, target_poses, sample["memory_condition"])
+        return pred_rgb, pred_depth
+    if spec.variant in {"diffusion_no_memory", "diffusion_memory"}:
+        pred_rgb, _ = model.sample(
+            context_rgb=context_rgb,
+            context_poses=context_poses,
+            target_poses=target_poses,
+            memory_condition=sample["memory_condition"] if spec.variant == "diffusion_memory" else None,
+            sample_steps=spec.sample_steps_eval or 25,
+            eta=0.0,
+            return_intermediates=False,
+        )
+        return pred_rgb, None
+    raise ValueError(f"Unsupported evaluation variant: {spec.variant}")
 
 
 def _aggregate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -181,17 +248,78 @@ def evaluate_run(
     if model is None:
         result["status"] = "missing"
         return result
+    run_payload = _load_run_metrics_payload(spec.run_dir)
+    confidence_threshold = float(run_payload.get("write_confidence_threshold", 0.55))
+    uncertainty_samples = int(run_payload.get("uncertainty_samples", 4))
 
     rows: list[dict[str, Any]] = []
     with torch.no_grad():
         for idx, stats in enumerate(window_stats):
             raw_sample = dataset[idx]
             sample = _move_sample_to_device(raw_sample, device)
-            pred_rgb, pred_depth = _predict(spec, model, sample)
-            target_rgb = sample["target_rgb"]
-            baseline_rgb = sample["context_rgb"][:, -1:].repeat(1, target_rgb.shape[1], 1, 1, 1)
-            dynamic_mask = motion_mask_from_last_context(sample["context_rgb"], target_rgb, threshold=motion_threshold)
-            memory_mask = sample["memory_render_mask"]
+            uncertainty = None
+            write_coverage = 0.0
+            confidence_mean = 0.0
+            if spec.variant == "memory_uncertainty_convgru":
+                rollout = rollout_convgru_uncertainty(
+                    model=model,
+                    clip_path=raw_sample["clip_path"],
+                    start_frame=int(raw_sample["start_frame"]),
+                    context_frames=dataset.context_frames,
+                    predict_frames=dataset.predict_frames,
+                    image_size=dataset.image_size or sample["target_rgb"].shape[-1],
+                    device=device,
+                    memory_grid_resolution=dataset.memory_grid_resolution,
+                    memory_stride=dataset.memory_stride,
+                    memory_splat_radius=dataset.memory_splat_radius,
+                    confidence_threshold=confidence_threshold,
+                )
+                pred_rgb = rollout["prediction"].unsqueeze(0).to(device)
+                pred_depth = rollout["pred_depth"].unsqueeze(0).to(device)
+                target_rgb = rollout["window"].target_rgb.to(device)
+                baseline_rgb = rollout["window"].context_rgb[:, -1:].repeat(1, target_rgb.shape[1], 1, 1, 1).to(device)
+                dynamic_mask = motion_mask_from_last_context(rollout["window"].context_rgb.to(device), target_rgb, threshold=motion_threshold)
+                memory_mask = rollout["memory_render_mask"].unsqueeze(0).to(device)
+                uncertainty = rollout["uncertainty"].unsqueeze(0).to(device)
+                memory_render_rgb = rollout["memory_render_rgb"].unsqueeze(0).to(device)
+                write_coverage = float(rollout["write_coverage"])
+                confidence_mean = float(rollout["confidence_mean"])
+                target_depth_tensor = rollout["window"].target_depth.to(device)
+            elif spec.variant == "diffusion_memory_uncertainty":
+                rollout = rollout_diffusion_uncertainty(
+                    model=model,
+                    clip_path=raw_sample["clip_path"],
+                    start_frame=int(raw_sample["start_frame"]),
+                    context_frames=dataset.context_frames,
+                    predict_frames=dataset.predict_frames,
+                    image_size=dataset.image_size or sample["target_rgb"].shape[-1],
+                    device=device,
+                    memory_grid_resolution=dataset.memory_grid_resolution,
+                    memory_stride=dataset.memory_stride,
+                    memory_splat_radius=dataset.memory_splat_radius,
+                    confidence_threshold=confidence_threshold,
+                    sample_steps=spec.sample_steps_eval or 25,
+                    uncertainty_samples=uncertainty_samples,
+                )
+                pred_rgb = rollout["prediction"].unsqueeze(0).to(device)
+                pred_depth = rollout["pred_depth"].unsqueeze(0).to(device)
+                target_rgb = rollout["window"].target_rgb.to(device)
+                baseline_rgb = rollout["window"].context_rgb[:, -1:].repeat(1, target_rgb.shape[1], 1, 1, 1).to(device)
+                dynamic_mask = motion_mask_from_last_context(rollout["window"].context_rgb.to(device), target_rgb, threshold=motion_threshold)
+                memory_mask = rollout["memory_render_mask"].unsqueeze(0).to(device)
+                uncertainty = rollout["uncertainty"].unsqueeze(0).to(device)
+                memory_render_rgb = rollout["memory_render_rgb"].unsqueeze(0).to(device)
+                write_coverage = float(rollout["write_coverage"])
+                confidence_mean = float(rollout["confidence_mean"])
+                target_depth_tensor = rollout["window"].target_depth.to(device)
+            else:
+                pred_rgb, pred_depth = _predict(spec, model, sample)
+                target_rgb = sample["target_rgb"]
+                baseline_rgb = sample["context_rgb"][:, -1:].repeat(1, target_rgb.shape[1], 1, 1, 1)
+                dynamic_mask = motion_mask_from_last_context(sample["context_rgb"], target_rgb, threshold=motion_threshold)
+                memory_mask = sample["memory_render_mask"]
+                memory_render_rgb = sample["memory_render_rgb"]
+                target_depth_tensor = sample["target_depth"]
             row = {
                 "index": idx,
                 "clip_path": stats.clip_path,
@@ -211,19 +339,25 @@ def evaluate_run(
                         memory_covered_l1(baseline_rgb, target_rgb, memory_mask),
                     )
                 ),
-                "oracle_alignment_l1": float(oracle_alignment_l1(pred_rgb, sample["memory_render_rgb"], memory_mask)),
-                "memory_render_coverage": float(raw_sample["memory_render_coverage"]),
+                "oracle_alignment_l1": float(oracle_alignment_l1(pred_rgb, memory_render_rgb, memory_mask)),
+                "memory_render_coverage": float(memory_mask.float().mean()),
                 "memory_occupancy_fraction": float(raw_sample["memory_occupancy_fraction"]),
-                "oracle_memory_render_l1_covered": float(raw_sample["memory_render_l1_covered"]),
+                "oracle_memory_render_l1_covered": float(masked_l1(memory_render_rgb, target_rgb, memory_mask)),
                 "motion_fraction": stats.motion_fraction,
                 "camera_translation": stats.camera_translation,
                 "camera_rotation_deg": stats.camera_rotation_deg,
                 "depth_edge_fraction": stats.depth_edge_fraction,
                 "occlusion_recovery": stats.occlusion_recovery,
+                "write_coverage": write_coverage,
+                "confidence_mean": confidence_mean,
             }
+            if uncertainty is not None:
+                error_map = (pred_rgb - target_rgb).abs().mean(dim=2, keepdim=True)
+                row["uncertainty_error_corr"] = float(uncertainty_error_correlation(uncertainty, error_map, mask=memory_mask))
+                row["high_error_auroc"] = float(high_error_auroc(uncertainty, error_map, mask=memory_mask))
             if pred_depth is not None:
-                depth_mask = (sample["target_depth"] > 0.0).to(dtype=sample["target_depth"].dtype)
-                row["model_depth_l1"] = float(masked_l1(pred_depth, sample["target_depth"], depth_mask))
+                depth_mask = (target_depth_tensor > 0.0).to(dtype=target_depth_tensor.dtype)
+                row["model_depth_l1"] = float(masked_l1(pred_depth, target_depth_tensor, depth_mask))
             rows.append(row)
 
     overall = _aggregate_rows(rows)
@@ -255,6 +389,8 @@ def build_markdown_summary(
         "dyn_adv",
         "mem_cov_adv",
         "val_psnr",
+        "unc_corr",
+        "write_cov",
     ]
     rows = []
     for result in results:
@@ -269,6 +405,8 @@ def build_markdown_summary(
                 "-" if "dynamic_advantage" not in overall else f"{overall['dynamic_advantage']:.4f}",
                 "-" if "memory_covered_advantage" not in overall else f"{overall['memory_covered_advantage']:.4f}",
                 "-" if "model_psnr" not in overall else f"{overall['model_psnr']:.4f}",
+                "-" if "uncertainty_error_corr" not in overall else f"{overall['uncertainty_error_corr']:.4f}",
+                "-" if "write_coverage" not in overall else f"{overall['write_coverage']:.4f}",
             ]
         )
     lines = [
@@ -291,8 +429,8 @@ def build_markdown_summary(
         lines.append("")
         lines.append(f"Count: {info['count']}")
         lines.append("")
-        lines.append("| run | status | l1 | dyn_l1 | mem_cov_l1 | dyn_adv | mem_cov_adv |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| run | status | l1 | dyn_l1 | mem_cov_l1 | dyn_adv | mem_cov_adv | unc_corr | write_cov |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for result in results:
             aggregate = result.get("slices", {}).get(slice_name, {})
             lines.append(
@@ -306,6 +444,8 @@ def build_markdown_summary(
                         "-" if "model_memory_covered_l1" not in aggregate else f"{aggregate['model_memory_covered_l1']:.4f}",
                         "-" if "dynamic_advantage" not in aggregate else f"{aggregate['dynamic_advantage']:.4f}",
                         "-" if "memory_covered_advantage" not in aggregate else f"{aggregate['memory_covered_advantage']:.4f}",
+                        "-" if "uncertainty_error_corr" not in aggregate else f"{aggregate['uncertainty_error_corr']:.4f}",
+                        "-" if "write_coverage" not in aggregate else f"{aggregate['write_coverage']:.4f}",
                     ]
                 )
                 + " |"
@@ -329,6 +469,9 @@ def write_evaluation_outputs(
             "run_dir": str(spec.run_dir),
             "checkpoint_path": str(spec.checkpoint_path),
             "hidden_channels": spec.hidden_channels,
+            "model_channels": spec.model_channels,
+            "diffusion_steps": spec.diffusion_steps,
+            "sample_steps_eval": spec.sample_steps_eval,
             "status": spec.status,
         }
         for spec in run_specs

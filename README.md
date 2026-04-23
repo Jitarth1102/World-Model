@@ -142,9 +142,69 @@ By default the script looks for:
 - `no_memory`
 - `memory_baseline`
 - `memory_strengthened`
+- `diffusion_no_memory`
+- `diffusion_memory`
 - `uncertainty_writes`
 
 The uncertainty row is allowed to be missing until that phase is implemented.
+
+## Diffusion branch
+
+An optional lightweight conditional diffusion branch is available alongside the
+main ConvGRU pipeline. It uses the same exported MOVi windows and the same
+artifact layout.
+
+Smoke-train the no-memory diffusion model:
+
+```bash
+PYTHONPATH=src python3 scripts/train_diffusion.py \
+  --variant no_memory \
+  --manifest data/processed/movi_a_128_subset50/manifest.json \
+  --epochs 1 \
+  --steps 4 \
+  --batch-size 2 \
+  --image-size 64 \
+  --context-frames 4 \
+  --predict-frames 4 \
+  --model-channels 32 \
+  --diffusion-steps 32 \
+  --sample-steps-eval 8 \
+  --eval-max-batches 1 \
+  --max-train-windows-per-clip 2 \
+  --max-val-windows-per-clip 1 \
+  --output-dir outputs/train_diffusion_nomemory_real_movia_subset50_v1
+```
+
+Smoke-train the memory-conditioned diffusion model:
+
+```bash
+PYTHONPATH=src python3 scripts/train_diffusion.py \
+  --variant memory \
+  --manifest data/processed/movi_a_128_subset50/manifest.json \
+  --epochs 1 \
+  --steps 4 \
+  --batch-size 2 \
+  --image-size 64 \
+  --context-frames 4 \
+  --predict-frames 4 \
+  --model-channels 32 \
+  --diffusion-steps 32 \
+  --sample-steps-eval 8 \
+  --eval-max-batches 1 \
+  --max-train-windows-per-clip 2 \
+  --max-val-windows-per-clip 1 \
+  --output-dir outputs/train_diffusion_memory_real_movia_subset50_v1
+```
+
+Run a diffusion rollout:
+
+```bash
+PYTHONPATH=src python3 scripts/rollout_diffusion.py \
+  --checkpoint outputs/train_diffusion_memory_real_movia_subset50_v1/diffusion_model_best.pt \
+  --clip data/processed/movi_a_128_subset50/00000.npz \
+  --start-frame 0 \
+  --output-dir outputs/train_diffusion_memory_real_movia_subset50_v1/rollout_00000
+```
 
 ## Phase 5 evaluation
 

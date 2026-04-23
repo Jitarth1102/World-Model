@@ -13,13 +13,20 @@ DEFAULT_RUNS = OrderedDict(
         ("no_memory", ("no_memory", Path("outputs/train_nomemory_real_movia_subset50_v4"))),
         ("memory_baseline", ("memory", Path("outputs/train_memory_real_movia_subset50_v1"))),
         ("memory_strengthened", ("memory", Path("outputs/train_memory_real_movia_subset50_v3"))),
-        ("uncertainty_writes", ("memory", Path("outputs/train_memory_uncertainty_real_movia_subset50_v1"))),
+        ("memory_uncertainty_convgru", ("memory_uncertainty_convgru", Path("outputs/train_memory_uncertainty_real_movia_subset50_v1"))),
+        ("diffusion_memory_uncertainty", ("diffusion_memory_uncertainty", Path("outputs/train_diffusion_memory_uncertainty_real_movia_subset50_v1"))),
     ]
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Phase 5 evaluation harness over current experiment checkpoints.")
+    parser.add_argument(
+        "--run",
+        action="append",
+        default=[],
+        help="Override default runs with LABEL=VARIANT:PATH. Variants: no_memory, memory, memory_uncertainty_convgru, diffusion_no_memory, diffusion_memory, diffusion_memory_uncertainty.",
+    )
     parser.add_argument("--manifest", type=Path, default=Path("data/processed/movi_a_128_subset50/manifest.json"))
     parser.add_argument("--context-frames", type=int, default=4)
     parser.add_argument("--predict-frames", type=int, default=4)
@@ -37,12 +44,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_run_mapping(overrides: list[str]) -> OrderedDict[str, tuple[str, Path]]:
+    if not overrides:
+        return DEFAULT_RUNS.copy()
+    mapping: OrderedDict[str, tuple[str, Path]] = OrderedDict()
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(f"Expected LABEL=VARIANT:PATH, got: {override}")
+        label, raw_value = override.split("=", 1)
+        if ":" not in raw_value:
+            raise ValueError(f"Expected LABEL=VARIANT:PATH, got: {override}")
+        variant, raw_path = raw_value.split(":", 1)
+        mapping[label.strip()] = (variant.strip(), Path(raw_path).expanduser())
+    return mapping
+
+
 def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
+    runs = parse_run_mapping(args.run)
     json_path, markdown_path = run_full_evaluation(
         manifest=args.manifest,
-        default_runs=DEFAULT_RUNS,
+        default_runs=runs,
         output_dir=args.output_dir,
         context_frames=args.context_frames,
         predict_frames=args.predict_frames,
