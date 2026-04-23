@@ -122,3 +122,51 @@ Each clip output directory contains:
 - `last_frame_render.png`
 - `summary.png`
 - `metrics.json`
+
+## Compare runs
+
+Summarize the current learned runs in one place:
+
+```bash
+PYTHONPATH=src python3 scripts/compare_run_metrics.py \
+  --output-dir outputs/model_comparison_current
+```
+
+This writes:
+
+- `outputs/model_comparison_current/comparison.md`
+- `outputs/model_comparison_current/comparison.json`
+
+By default the script looks for:
+
+- `no_memory`
+- `memory_baseline`
+- `memory_strengthened`
+- `uncertainty_writes`
+
+The uncertainty row is allowed to be missing until that phase is implemented.
+
+## Phase 5 evaluation
+
+Run the benchmark harness over the validation split:
+
+```bash
+PYTHONPATH=src python3 scripts/eval_all.py \
+  --checkpoint-kind last \
+  --output-dir outputs/eval_phase5_current
+```
+
+This writes:
+
+- `outputs/eval_phase5_current/evaluation.md`
+- `outputs/eval_phase5_current/evaluation.json`
+
+The current harness evaluates:
+
+- overall validation metrics
+- `high_motion`
+- `occlusion_recovery`
+- `high_memory_coverage`
+- `depth_edge_heavy`
+
+It also includes a `high_camera_motion` slice, which may be empty on `MOVi-A` if the camera is effectively static in the exported subset.
