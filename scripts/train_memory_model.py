@@ -17,6 +17,11 @@ from world_model.models.world_model import MemoryConditionedWorldModel
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Phase 4 persistent-memory world model.")
     parser.add_argument("--manifest", type=Path, default=Path("data/processed/movi_a_128_subset50/manifest.json"))
+    parser.add_argument(
+        "--warm-start-nomemory-checkpoint",
+        type=Path,
+        default=Path("outputs/train_nomemory_real_movia_subset50_v4/nomemory_model_best.pt"),
+    )
     parser.add_argument("--steps", type=int, default=None, help="Optional hard cap on optimizer steps.")
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -32,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-threshold", type=float, default=0.03)
     parser.add_argument("--dynamic-loss-weight", type=float, default=2.0)
     parser.add_argument("--depth-loss-weight", type=float, default=0.1)
+    parser.add_argument("--memory-covered-loss-weight", type=float, default=1.0)
+    parser.add_argument("--memory-render-loss-weight", type=float, default=0.0)
     parser.add_argument("--memory-grid-resolution", type=int, nargs=3, default=(48, 40, 48))
     parser.add_argument("--memory-stride", type=int, default=1)
     parser.add_argument("--memory-splat-radius", type=int, default=1)
@@ -97,23 +104,101 @@ def baseline_copy_last(context_rgb: torch.Tensor, predict_frames: int) -> torch.
     return last_frame.repeat(1, predict_frames, 1, 1, 1)
 
 
+def warm_start_from_nomemory_checkpoint(
+    model: MemoryConditionedWorldModel,
+    checkpoint_path: Path | None,
+) -> dict[str, object]:
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return {
+            "applied": False,
+            "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
+            "loaded_keys": [],
+            "missing_checkpoint": checkpoint_path is not None and not checkpoint_path.exists(),
+        }
+
+    source_state = torch.load(checkpoint_path, map_location="cpu")
+    model_state = model.state_dict()
+    loaded_keys: list[str] = []
+
+    def copy_if_compatible(source_key: str, target_key: str) -> None:
+        if source_key not in source_state or target_key not in model_state:
+            return
+        if source_state[source_key].shape != model_state[target_key].shape:
+            return
+        model_state[target_key] = source_state[source_key].clone()
+        loaded_keys.append(target_key)
+
+    direct_prefix_map = {
+        "encoder.": "image_encoder.",
+        "pose_proj.": "pose_proj.",
+        "temporal_cell.": "temporal_cell.",
+        "decoder.": "rgb_decoder.",
+    }
+    for source_key in source_state:
+        for source_prefix, target_prefix in direct_prefix_map.items():
+            if source_key.startswith(source_prefix):
+                copy_if_compatible(source_key, target_prefix + source_key[len(source_prefix) :])
+                break
+
+    # Initialize the memory encoder from the RGB encoder where shapes allow.
+    memory_first = "memory_encoder.net.0.weight"
+    source_first = "encoder.net.0.weight"
+    if source_first in source_state and memory_first in model_state:
+        source_weight = source_state[source_first]
+        target_weight = model_state[memory_first].clone()
+        if source_weight.shape[0] == target_weight.shape[0] and source_weight.shape[2:] == target_weight.shape[2:]:
+            target_weight.zero_()
+            target_weight[:, : source_weight.shape[1]] = source_weight
+            model_state[memory_first] = target_weight
+            loaded_keys.append(memory_first)
+
+    for suffix in [
+        "net.0.bias",
+        "net.2.weight",
+        "net.2.bias",
+        "net.4.weight",
+        "net.4.bias",
+    ]:
+        copy_if_compatible(f"encoder.{suffix}", f"memory_encoder.{suffix}")
+
+    model.load_state_dict(model_state)
+    return {
+        "applied": True,
+        "checkpoint": str(checkpoint_path),
+        "loaded_keys": sorted(set(loaded_keys)),
+        "missing_checkpoint": False,
+    }
+
+
 def compute_loss(
     pred_rgb: torch.Tensor,
     pred_depth: torch.Tensor,
     target_rgb: torch.Tensor,
     target_depth: torch.Tensor,
     context_rgb: torch.Tensor,
+    memory_render_rgb: torch.Tensor,
+    memory_render_mask: torch.Tensor,
     motion_threshold: float,
     dynamic_loss_weight: float,
     depth_loss_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    memory_covered_loss_weight: float,
+    memory_render_loss_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     full_l1 = masked_l1(pred_rgb, target_rgb)
     dynamic_mask = motion_mask_from_last_context(context_rgb, target_rgb, threshold=motion_threshold)
     dynamic_l1 = masked_l1(pred_rgb, target_rgb, dynamic_mask)
     depth_mask = (target_depth > 0.0).to(dtype=pred_depth.dtype)
     depth_l1 = masked_l1(pred_depth, target_depth, depth_mask)
-    objective = full_l1 + dynamic_loss_weight * dynamic_l1 + depth_loss_weight * depth_l1
-    return objective, full_l1, dynamic_l1, depth_l1
+    memory_covered_l1 = masked_l1(pred_rgb, target_rgb, memory_render_mask)
+    memory_render_l1 = masked_l1(pred_rgb, memory_render_rgb, memory_render_mask)
+    objective = (
+        full_l1
+        + dynamic_loss_weight * dynamic_l1
+        + depth_loss_weight * depth_l1
+        + memory_covered_loss_weight * memory_covered_l1
+        + memory_render_loss_weight * memory_render_l1
+    )
+    return objective, full_l1, dynamic_l1, depth_l1, memory_covered_l1, memory_render_l1
 
 
 def move_batch_to_device(batch: dict[str, torch.Tensor | str | int | float], device: torch.device) -> dict[str, torch.Tensor | str | int | float]:
@@ -144,6 +229,8 @@ def evaluate_model(
     total_model_dynamic_l1 = 0.0
     total_base_dynamic_l1 = 0.0
     total_model_depth_l1 = 0.0
+    total_model_memory_covered_l1 = 0.0
+    total_base_memory_covered_l1 = 0.0
     total_motion_fraction = 0.0
     total_memory_coverage = 0.0
     total_memory_occupancy = 0.0
@@ -164,6 +251,7 @@ def evaluate_model(
         baseline = baseline_copy_last(context_rgb, target_rgb.shape[1])
         dynamic_mask = motion_mask_from_last_context(context_rgb, target_rgb, threshold=motion_threshold)
         depth_mask = (target_depth > 0.0).to(dtype=pred_depth.dtype)
+        memory_mask = batch["memory_render_mask"]
 
         total_model_l1 += float(masked_l1(pred_rgb, target_rgb))
         total_model_psnr += float(psnr(pred_rgb, target_rgb))
@@ -172,6 +260,8 @@ def evaluate_model(
         total_model_dynamic_l1 += float(masked_l1(pred_rgb, target_rgb, dynamic_mask))
         total_base_dynamic_l1 += float(masked_l1(baseline, target_rgb, dynamic_mask))
         total_model_depth_l1 += float(masked_l1(pred_depth, target_depth, depth_mask))
+        total_model_memory_covered_l1 += float(masked_l1(pred_rgb, target_rgb, memory_mask))
+        total_base_memory_covered_l1 += float(masked_l1(baseline, target_rgb, memory_mask))
         total_motion_fraction += float(dynamic_mask.mean())
         total_memory_coverage += float(batch["memory_render_coverage"].float().mean())
         total_memory_occupancy += float(batch["memory_occupancy_fraction"].float().mean())
@@ -205,6 +295,8 @@ def evaluate_model(
         "model_dynamic_l1": total_model_dynamic_l1 / num_batches,
         "baseline_dynamic_l1": total_base_dynamic_l1 / num_batches,
         "model_depth_l1": total_model_depth_l1 / num_batches,
+        "model_memory_covered_l1": total_model_memory_covered_l1 / num_batches,
+        "baseline_memory_covered_l1": total_base_memory_covered_l1 / num_batches,
         "motion_fraction": total_motion_fraction / num_batches,
         "memory_coverage": total_memory_coverage / num_batches,
         "memory_occupancy_fraction": total_memory_occupancy / num_batches,
@@ -241,6 +333,7 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = MemoryConditionedWorldModel(hidden_channels=args.hidden_channels).to(device)
+    warm_start_report = warm_start_from_nomemory_checkpoint(model, args.warm_start_nomemory_checkpoint)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     history: list[dict[str, float | int]] = []
@@ -254,6 +347,8 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
         running_psnr = 0.0
         running_dynamic = 0.0
         running_depth = 0.0
+        running_memory_covered = 0.0
+        running_memory_render = 0.0
         num_batches = 0
 
         for batch in train_loader:
@@ -264,15 +359,19 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
                 batch["target_poses"],
                 batch["memory_condition"],
             )
-            objective, full_l1, dynamic_l1, depth_l1 = compute_loss(
+            objective, full_l1, dynamic_l1, depth_l1, memory_covered_l1, memory_render_l1 = compute_loss(
                 pred_rgb=pred_rgb,
                 pred_depth=pred_depth,
                 target_rgb=batch["target_rgb"],
                 target_depth=batch["target_depth"],
                 context_rgb=batch["context_rgb"],
+                memory_render_rgb=batch["memory_render_rgb"],
+                memory_render_mask=batch["memory_render_mask"],
                 motion_threshold=args.motion_threshold,
                 dynamic_loss_weight=args.dynamic_loss_weight,
                 depth_loss_weight=args.depth_loss_weight,
+                memory_covered_loss_weight=args.memory_covered_loss_weight,
+                memory_render_loss_weight=args.memory_render_loss_weight,
             )
             optimizer.zero_grad()
             objective.backward()
@@ -283,6 +382,8 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
             running_psnr += float(psnr(pred_rgb.detach(), batch["target_rgb"]))
             running_dynamic += float(dynamic_l1.detach())
             running_depth += float(depth_l1.detach())
+            running_memory_covered += float(memory_covered_l1.detach())
+            running_memory_render += float(memory_render_l1.detach())
             num_batches += 1
             global_step += 1
             if args.steps is not None and global_step >= args.steps:
@@ -294,6 +395,8 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
             "train_psnr": running_psnr / max(num_batches, 1),
             "train_dynamic_l1": running_dynamic / max(num_batches, 1),
             "train_depth_l1": running_depth / max(num_batches, 1),
+            "train_memory_covered_l1": running_memory_covered / max(num_batches, 1),
+            "train_memory_render_l1": running_memory_render / max(num_batches, 1),
         }
         val_metrics, example = evaluate_model(model, val_loader, device, motion_threshold=args.motion_threshold)
         epoch_metrics: dict[str, float | int] = {
@@ -304,8 +407,10 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
         history.append(epoch_metrics)
         print(
             f"epoch={epoch:02d} train_obj={train_metrics['train_objective']:.4f} train_l1={train_metrics['train_l1']:.4f} "
-            f"train_dyn={train_metrics['train_dynamic_l1']:.4f} train_depth={train_metrics['train_depth_l1']:.4f} "
+            f"train_dyn={train_metrics['train_dynamic_l1']:.4f} train_cov={train_metrics['train_memory_covered_l1']:.4f} "
+            f"train_depth={train_metrics['train_depth_l1']:.4f} "
             f"val_l1={val_metrics['model_l1']:.4f} val_dyn={val_metrics['model_dynamic_l1']:.4f} "
+            f"val_cov={val_metrics['model_memory_covered_l1']:.4f} base_cov={val_metrics['baseline_memory_covered_l1']:.4f} "
             f"baseline_l1={val_metrics['baseline_l1']:.4f} baseline_dyn={val_metrics['baseline_dynamic_l1']:.4f} "
             f"memory_cov={val_metrics['memory_coverage']:.4f}"
         )
@@ -363,9 +468,12 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
         "motion_threshold": args.motion_threshold,
         "dynamic_loss_weight": args.dynamic_loss_weight,
         "depth_loss_weight": args.depth_loss_weight,
+        "memory_covered_loss_weight": args.memory_covered_loss_weight,
+        "memory_render_loss_weight": args.memory_render_loss_weight,
         "memory_grid_resolution": list(args.memory_grid_resolution),
         "memory_stride": args.memory_stride,
         "memory_splat_radius": args.memory_splat_radius,
+        "warm_start": warm_start_report,
         "num_train_clips": len(train_paths),
         "num_val_clips": len(val_paths),
         "num_train_windows": len(train_dataset),
@@ -377,6 +485,7 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
         "example_start_frame": example["start_frame"],
         "model_beats_baseline_on_val_l1": final_val_metrics["model_l1"] < final_val_metrics["baseline_l1"],
         "model_beats_baseline_on_val_dynamic_l1": final_val_metrics["model_dynamic_l1"] < final_val_metrics["baseline_dynamic_l1"],
+        "model_beats_baseline_on_val_memory_covered_l1": final_val_metrics["model_memory_covered_l1"] < final_val_metrics["baseline_memory_covered_l1"],
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

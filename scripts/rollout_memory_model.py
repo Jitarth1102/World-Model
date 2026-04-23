@@ -114,15 +114,18 @@ def main() -> None:
         pred_rgb, pred_depth = model(context_rgb, context_poses, target_poses, memory_condition)
     dynamic_mask = motion_mask_from_last_context(context_rgb, target_rgb, threshold=args.motion_threshold)
     depth_mask = (target_depth > 0.0).to(dtype=pred_depth.dtype)
+    memory_mask = sample["memory_render_mask"].unsqueeze(0).to(device)
 
     metrics = {
         "model_l1": float(masked_l1(pred_rgb, target_rgb)),
         "model_psnr": float(psnr(pred_rgb, target_rgb)),
         "model_dynamic_l1": float(masked_l1(pred_rgb, target_rgb, dynamic_mask)),
         "model_depth_l1": float(masked_l1(pred_depth, target_depth, depth_mask)),
+        "model_memory_covered_l1": float(masked_l1(pred_rgb, target_rgb, memory_mask)),
         "baseline_l1": float(masked_l1(baseline, target_rgb)),
         "baseline_psnr": float(psnr(baseline, target_rgb)),
         "baseline_dynamic_l1": float(masked_l1(baseline, target_rgb, dynamic_mask)),
+        "baseline_memory_covered_l1": float(masked_l1(baseline, target_rgb, memory_mask)),
         "motion_fraction": float(dynamic_mask.mean()),
         "memory_coverage": float(sample["memory_render_coverage"]),
         "memory_occupancy_fraction": float(sample["memory_occupancy_fraction"]),
