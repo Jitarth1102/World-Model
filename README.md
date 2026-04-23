@@ -68,6 +68,29 @@ The script converts raw examples into compressed `.npz` clips with:
 - `visibility`
 - `metadata`
 
+### Real MOVi-A export
+
+On macOS arm64, create a Python 3.11 env for the TFDS export path:
+
+```bash
+conda create -y -p ./.conda-movi python=3.11 pip numpy matplotlib pillow
+conda run -p ./.conda-movi pip install '.[data]'
+```
+
+Export a small real MOVi-A subset:
+
+```bash
+conda run --no-capture-output -p ./.conda-movi \
+  env PYTHONPATH=src \
+  python scripts/prepare_movi.py \
+  --dataset movi_a \
+  --resolution 128x128 \
+  --split train \
+  --limit 50 \
+  --data-dir gs://kubric-public/tfds \
+  --output-dir data/processed/movi_a_128_subset50
+```
+
 ## Oracle memory demo
 
 `debug_oracle_memory.py` builds persistent memory from context frames and renders a held-out target view. It also renders a `last-frame-only` comparison to make persistence visible quickly.
@@ -78,4 +101,24 @@ Outputs:
 - `target_render.png`
 - `last_frame_render.png`
 - `context_strip.png`
+- `metrics.json`
+
+Run the real-data oracle-memory demo across the exported subset:
+
+```bash
+conda run --no-capture-output -p ./.conda-movi \
+  env PYTHONPATH=src \
+  python scripts/eval_oracle_memory_subset.py \
+  --manifest data/processed/movi_a_128_subset50/manifest.json \
+  --limit 50 \
+  --output-dir outputs/movi_a_real_oracle_subset50
+```
+
+Each clip output directory contains:
+
+- `context_strip.png`
+- `target_gt.png`
+- `target_render.png`
+- `last_frame_render.png`
+- `summary.png`
 - `metrics.json`

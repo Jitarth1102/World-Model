@@ -18,7 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 data = [
   "tensorflow-datasets>=4.9",
-  "tensorflow>=2.16",
+  "tensorflow>=2.16; platform_system != 'Darwin' or platform_machine != 'arm64'",
+  "tensorflow-macos==2.16.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 
 [tool.setuptools]
