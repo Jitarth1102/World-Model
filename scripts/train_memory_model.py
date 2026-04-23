@@ -2,97 +2,392 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
 from PIL import Image
+from torch.utils.data import DataLoader
 
-from world_model.data.synthetic import make_synthetic_clip
-from world_model.eval.metrics_image import masked_l1, psnr
-from world_model.memory.oracle_writer import accumulate_clip_into_memory
-from world_model.memory.renderer import render_memory_view
-from world_model.memory.voxel_grid import VoxelGridSpec
+from world_model.data.clip_dataset import MemoryConditionedClipWindowDataset, load_manifest, split_clip_paths
+from world_model.eval.metrics_image import masked_l1, motion_mask_from_last_context, psnr
 from world_model.models.world_model import MemoryConditionedWorldModel
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tiny synthetic overfit loop for the memory-conditioned model.")
-    parser.add_argument("--steps", type=int, default=100)
+    parser = argparse.ArgumentParser(description="Train the Phase 4 persistent-memory world model.")
+    parser.add_argument("--manifest", type=Path, default=Path("data/processed/movi_a_128_subset50/manifest.json"))
+    parser.add_argument("--steps", type=int, default=None, help="Optional hard cap on optimizer steps.")
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--context-frames", type=int, default=4)
-    parser.add_argument("--predict-frames", type=int, default=2)
+    parser.add_argument("--predict-frames", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/train_memory_model"))
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--hidden-channels", type=int, default=96)
+    parser.add_argument("--max-train-windows-per-clip", type=int, default=12)
+    parser.add_argument("--max-val-windows-per-clip", type=int, default=6)
+    parser.add_argument("--motion-threshold", type=float, default=0.03)
+    parser.add_argument("--dynamic-loss-weight", type=float, default=2.0)
+    parser.add_argument("--depth-loss-weight", type=float, default=0.1)
+    parser.add_argument("--memory-grid-resolution", type=int, nargs=3, default=(48, 40, 48))
+    parser.add_argument("--memory-stride", type=int, default=1)
+    parser.add_argument("--memory-splat-radius", type=int, default=1)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/train_memory_real"))
     return parser.parse_args()
 
 
-def build_memory_conditions(clip, context_frames: int, predict_frames: int) -> torch.Tensor:
-    spec = VoxelGridSpec(bounds_min=(-2.0, -1.5, -2.0), bounds_max=(2.0, 1.8, 2.0), resolution=(48, 40, 48))
-    memory, _ = accumulate_clip_into_memory(clip, context_frames=context_frames, memory_spec=spec)
-    conditions = []
-    for frame_idx in range(context_frames, context_frames + predict_frames):
-        rendered = render_memory_view(memory, clip.poses[frame_idx], clip.intrinsics, splat_radius=1)
-        rgba = torch.cat(
-            [
-                torch.from_numpy(rendered.rgb).permute(2, 0, 1),
-                torch.from_numpy(rendered.mask.astype("float32")).unsqueeze(0),
-            ],
-            dim=0,
-        ).float()
-        conditions.append(rgba)
-    return torch.stack(conditions, dim=0)
+def pick_device(requested: str) -> torch.device:
+    if requested != "auto":
+        return torch.device(requested)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
-def save_strip(target_rgb: torch.Tensor, predicted_rgb: torch.Tensor, path: Path) -> None:
-    frames = []
-    target_np = (target_rgb.clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
-    pred_np = (predicted_rgb.clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8")
-    for idx in range(target_np.shape[0]):
-        frames.append(target_np[idx].transpose(1, 2, 0))
-        frames.append(pred_np[idx].transpose(1, 2, 0))
-    strip = Image.new("RGB", (frames[0].shape[1] * len(frames), frames[0].shape[0]))
-    for idx, frame in enumerate(frames):
-        strip.paste(Image.fromarray(frame), (idx * frame.shape[1], 0))
-    strip.save(path)
+def save_strip(frames: list[torch.Tensor], path: Path) -> None:
+    np_frames = [(frame.clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8") for frame in frames]
+    height, width = np_frames[0].shape[1], np_frames[0].shape[2]
+    canvas = Image.new("RGB", (width * len(np_frames), height))
+    for idx, frame in enumerate(np_frames):
+        canvas.paste(Image.fromarray(frame.transpose(1, 2, 0)), (idx * width, 0))
+    canvas.save(path)
+
+
+def save_mask_strip(frames: list[torch.Tensor], path: Path) -> None:
+    np_frames = [(frame.squeeze(0).cpu().numpy() * 255.0).astype("uint8") for frame in frames]
+    height, width = np_frames[0].shape
+    canvas = Image.new("L", (width * len(np_frames), height))
+    for idx, frame in enumerate(np_frames):
+        canvas.paste(Image.fromarray(frame), (idx * width, 0))
+    canvas.save(path)
+
+
+def save_comparison(
+    context_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    predicted_rgb: torch.Tensor,
+    baseline_rgb: torch.Tensor,
+    output_path: Path,
+) -> None:
+    rows = []
+    for tensor in [context_rgb, target_rgb, predicted_rgb, baseline_rgb]:
+        np_frames = [(frame.clamp(0.0, 1.0).cpu().numpy() * 255.0).astype("uint8") for frame in tensor]
+        height, width = np_frames[0].shape[1], np_frames[0].shape[2]
+        row = Image.new("RGB", (width * len(np_frames), height))
+        for idx, frame in enumerate(np_frames):
+            row.paste(Image.fromarray(frame.transpose(1, 2, 0)), (idx * width, 0))
+        rows.append(row)
+
+    canvas = Image.new("RGB", (rows[0].width, sum(row.height for row in rows)))
+    y_offset = 0
+    for row in rows:
+        canvas.paste(row, (0, y_offset))
+        y_offset += row.height
+    canvas.save(output_path)
+
+
+def baseline_copy_last(context_rgb: torch.Tensor, predict_frames: int) -> torch.Tensor:
+    last_frame = context_rgb[:, -1:]
+    return last_frame.repeat(1, predict_frames, 1, 1, 1)
+
+
+def compute_loss(
+    pred_rgb: torch.Tensor,
+    pred_depth: torch.Tensor,
+    target_rgb: torch.Tensor,
+    target_depth: torch.Tensor,
+    context_rgb: torch.Tensor,
+    motion_threshold: float,
+    dynamic_loss_weight: float,
+    depth_loss_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    full_l1 = masked_l1(pred_rgb, target_rgb)
+    dynamic_mask = motion_mask_from_last_context(context_rgb, target_rgb, threshold=motion_threshold)
+    dynamic_l1 = masked_l1(pred_rgb, target_rgb, dynamic_mask)
+    depth_mask = (target_depth > 0.0).to(dtype=pred_depth.dtype)
+    depth_l1 = masked_l1(pred_depth, target_depth, depth_mask)
+    objective = full_l1 + dynamic_loss_weight * dynamic_l1 + depth_loss_weight * depth_l1
+    return objective, full_l1, dynamic_l1, depth_l1
+
+
+def move_batch_to_device(batch: dict[str, torch.Tensor | str | int | float], device: torch.device) -> dict[str, torch.Tensor | str | int | float]:
+    moved: dict[str, torch.Tensor | str | int | float] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point():
+                moved[key] = value.to(device=device, dtype=torch.float32)
+            else:
+                moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: MemoryConditionedWorldModel,
+    loader: DataLoader,
+    device: torch.device,
+    motion_threshold: float,
+) -> tuple[dict[str, float], dict[str, torch.Tensor | str | int | float]]:
+    model.eval()
+    total_model_l1 = 0.0
+    total_model_psnr = 0.0
+    total_base_l1 = 0.0
+    total_base_psnr = 0.0
+    total_model_dynamic_l1 = 0.0
+    total_base_dynamic_l1 = 0.0
+    total_model_depth_l1 = 0.0
+    total_motion_fraction = 0.0
+    total_memory_coverage = 0.0
+    total_memory_occupancy = 0.0
+    total_memory_render_l1 = 0.0
+    num_batches = 0
+    first_example: dict[str, torch.Tensor | str | int | float] | None = None
+
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        context_rgb = batch["context_rgb"]
+        target_rgb = batch["target_rgb"]
+        context_poses = batch["context_poses"]
+        target_poses = batch["target_poses"]
+        target_depth = batch["target_depth"]
+        memory_condition = batch["memory_condition"]
+
+        pred_rgb, pred_depth = model(context_rgb, context_poses, target_poses, memory_condition)
+        baseline = baseline_copy_last(context_rgb, target_rgb.shape[1])
+        dynamic_mask = motion_mask_from_last_context(context_rgb, target_rgb, threshold=motion_threshold)
+        depth_mask = (target_depth > 0.0).to(dtype=pred_depth.dtype)
+
+        total_model_l1 += float(masked_l1(pred_rgb, target_rgb))
+        total_model_psnr += float(psnr(pred_rgb, target_rgb))
+        total_base_l1 += float(masked_l1(baseline, target_rgb))
+        total_base_psnr += float(psnr(baseline, target_rgb))
+        total_model_dynamic_l1 += float(masked_l1(pred_rgb, target_rgb, dynamic_mask))
+        total_base_dynamic_l1 += float(masked_l1(baseline, target_rgb, dynamic_mask))
+        total_model_depth_l1 += float(masked_l1(pred_depth, target_depth, depth_mask))
+        total_motion_fraction += float(dynamic_mask.mean())
+        total_memory_coverage += float(batch["memory_render_coverage"].float().mean())
+        total_memory_occupancy += float(batch["memory_occupancy_fraction"].float().mean())
+        total_memory_render_l1 += float(batch["memory_render_l1_covered"].float().mean())
+        num_batches += 1
+
+        if first_example is None:
+            first_example = {
+                "context_rgb": context_rgb[0].detach().cpu(),
+                "target_rgb": target_rgb[0].detach().cpu(),
+                "prediction": pred_rgb[0].detach().cpu(),
+                "baseline": baseline[0].detach().cpu(),
+                "motion_mask": dynamic_mask[0].detach().cpu(),
+                "memory_render_rgb": batch["memory_render_rgb"][0].detach().cpu(),
+                "memory_render_mask": batch["memory_render_mask"][0].detach().cpu(),
+                "memory_render_depth": batch["memory_render_depth"][0].detach().cpu(),
+                "clip_path": batch["clip_path"][0] if isinstance(batch["clip_path"], list) else batch["clip_path"],
+                "start_frame": int(batch["start_frame"][0]) if isinstance(batch["start_frame"], torch.Tensor) else int(batch["start_frame"]),
+                "memory_render_coverage": float(batch["memory_render_coverage"][0]) if isinstance(batch["memory_render_coverage"], torch.Tensor) else float(batch["memory_render_coverage"]),
+                "memory_occupancy_fraction": float(batch["memory_occupancy_fraction"][0]) if isinstance(batch["memory_occupancy_fraction"], torch.Tensor) else float(batch["memory_occupancy_fraction"]),
+                "memory_render_l1_covered": float(batch["memory_render_l1_covered"][0]) if isinstance(batch["memory_render_l1_covered"], torch.Tensor) else float(batch["memory_render_l1_covered"]),
+            }
+
+    if num_batches == 0:
+        raise RuntimeError("Evaluation loader is empty.")
+    metrics = {
+        "model_l1": total_model_l1 / num_batches,
+        "model_psnr": total_model_psnr / num_batches,
+        "baseline_l1": total_base_l1 / num_batches,
+        "baseline_psnr": total_base_psnr / num_batches,
+        "model_dynamic_l1": total_model_dynamic_l1 / num_batches,
+        "baseline_dynamic_l1": total_base_dynamic_l1 / num_batches,
+        "model_depth_l1": total_model_depth_l1 / num_batches,
+        "motion_fraction": total_motion_fraction / num_batches,
+        "memory_coverage": total_memory_coverage / num_batches,
+        "memory_occupancy_fraction": total_memory_occupancy / num_batches,
+        "memory_render_l1_covered": total_memory_render_l1 / num_batches,
+    }
+    return metrics, first_example or {}
+
+
+def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> dict[str, object]:
+    clip_paths = load_manifest(args.manifest)
+    train_paths, val_paths = split_clip_paths(clip_paths, val_ratio=args.val_ratio, seed=args.seed)
+    train_dataset = MemoryConditionedClipWindowDataset(
+        clip_paths=train_paths,
+        context_frames=args.context_frames,
+        predict_frames=args.predict_frames,
+        image_size=args.image_size,
+        max_windows_per_clip=args.max_train_windows_per_clip,
+        memory_grid_resolution=tuple(args.memory_grid_resolution),
+        memory_stride=args.memory_stride,
+        memory_splat_radius=args.memory_splat_radius,
+    )
+    val_dataset = MemoryConditionedClipWindowDataset(
+        clip_paths=val_paths,
+        context_frames=args.context_frames,
+        predict_frames=args.predict_frames,
+        image_size=args.image_size,
+        max_windows_per_clip=args.max_val_windows_per_clip,
+        memory_grid_resolution=tuple(args.memory_grid_resolution),
+        memory_stride=args.memory_stride,
+        memory_splat_radius=args.memory_splat_radius,
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    model = MemoryConditionedWorldModel(hidden_channels=args.hidden_channels).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    history: list[dict[str, float | int]] = []
+    global_step = 0
+    best_val_l1 = float("inf")
+
+    for epoch in range(args.epochs):
+        model.train()
+        running_objective = 0.0
+        running_l1 = 0.0
+        running_psnr = 0.0
+        running_dynamic = 0.0
+        running_depth = 0.0
+        num_batches = 0
+
+        for batch in train_loader:
+            batch = move_batch_to_device(batch, device)
+            pred_rgb, pred_depth = model(
+                batch["context_rgb"],
+                batch["context_poses"],
+                batch["target_poses"],
+                batch["memory_condition"],
+            )
+            objective, full_l1, dynamic_l1, depth_l1 = compute_loss(
+                pred_rgb=pred_rgb,
+                pred_depth=pred_depth,
+                target_rgb=batch["target_rgb"],
+                target_depth=batch["target_depth"],
+                context_rgb=batch["context_rgb"],
+                motion_threshold=args.motion_threshold,
+                dynamic_loss_weight=args.dynamic_loss_weight,
+                depth_loss_weight=args.depth_loss_weight,
+            )
+            optimizer.zero_grad()
+            objective.backward()
+            optimizer.step()
+
+            running_objective += float(objective.detach())
+            running_l1 += float(full_l1.detach())
+            running_psnr += float(psnr(pred_rgb.detach(), batch["target_rgb"]))
+            running_dynamic += float(dynamic_l1.detach())
+            running_depth += float(depth_l1.detach())
+            num_batches += 1
+            global_step += 1
+            if args.steps is not None and global_step >= args.steps:
+                break
+
+        train_metrics = {
+            "train_objective": running_objective / max(num_batches, 1),
+            "train_l1": running_l1 / max(num_batches, 1),
+            "train_psnr": running_psnr / max(num_batches, 1),
+            "train_dynamic_l1": running_dynamic / max(num_batches, 1),
+            "train_depth_l1": running_depth / max(num_batches, 1),
+        }
+        val_metrics, example = evaluate_model(model, val_loader, device, motion_threshold=args.motion_threshold)
+        epoch_metrics: dict[str, float | int] = {
+            "epoch": epoch,
+            **train_metrics,
+            **val_metrics,
+        }
+        history.append(epoch_metrics)
+        print(
+            f"epoch={epoch:02d} train_obj={train_metrics['train_objective']:.4f} train_l1={train_metrics['train_l1']:.4f} "
+            f"train_dyn={train_metrics['train_dynamic_l1']:.4f} train_depth={train_metrics['train_depth_l1']:.4f} "
+            f"val_l1={val_metrics['model_l1']:.4f} val_dyn={val_metrics['model_dynamic_l1']:.4f} "
+            f"baseline_l1={val_metrics['baseline_l1']:.4f} baseline_dyn={val_metrics['baseline_dynamic_l1']:.4f} "
+            f"memory_cov={val_metrics['memory_coverage']:.4f}"
+        )
+
+        if val_metrics["model_l1"] < best_val_l1:
+            best_val_l1 = val_metrics["model_l1"]
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), args.output_dir / "memory_model_best.pt")
+            save_comparison(
+                example["context_rgb"],
+                example["target_rgb"],
+                example["prediction"],
+                example["baseline"],
+                args.output_dir / "best_val_comparison.png",
+            )
+            save_strip(list(example["target_rgb"]), args.output_dir / "best_val_target_strip.png")
+            save_strip(list(example["prediction"]), args.output_dir / "best_val_prediction_strip.png")
+            save_strip(list(example["baseline"]), args.output_dir / "best_val_baseline_strip.png")
+            save_strip(list(example["memory_render_rgb"]), args.output_dir / "best_val_memory_render_strip.png")
+            save_mask_strip(list(example["motion_mask"]), args.output_dir / "best_val_motion_mask_strip.png")
+            save_mask_strip(list(example["memory_render_mask"]), args.output_dir / "best_val_memory_mask_strip.png")
+
+        if args.steps is not None and global_step >= args.steps:
+            break
+
+    final_val_metrics, example = evaluate_model(model, val_loader, device, motion_threshold=args.motion_threshold)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), args.output_dir / "memory_model_last.pt")
+    save_comparison(
+        example["context_rgb"],
+        example["target_rgb"],
+        example["prediction"],
+        example["baseline"],
+        args.output_dir / "final_val_comparison.png",
+    )
+    save_strip(list(example["memory_render_rgb"]), args.output_dir / "final_val_memory_render_strip.png")
+    save_mask_strip(list(example["memory_render_mask"]), args.output_dir / "final_val_memory_mask_strip.png")
+    save_mask_strip(list(example["motion_mask"]), args.output_dir / "final_val_motion_mask_strip.png")
+
+    summary: dict[str, object] = {
+        "device": str(device),
+        "source": "npz",
+        "epochs_completed": len(history),
+        "global_steps": global_step,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "context_frames": args.context_frames,
+        "predict_frames": args.predict_frames,
+        "image_size": args.image_size,
+        "hidden_channels": args.hidden_channels,
+        "max_train_windows_per_clip": args.max_train_windows_per_clip,
+        "max_val_windows_per_clip": args.max_val_windows_per_clip,
+        "val_ratio": args.val_ratio,
+        "seed": args.seed,
+        "motion_threshold": args.motion_threshold,
+        "dynamic_loss_weight": args.dynamic_loss_weight,
+        "depth_loss_weight": args.depth_loss_weight,
+        "memory_grid_resolution": list(args.memory_grid_resolution),
+        "memory_stride": args.memory_stride,
+        "memory_splat_radius": args.memory_splat_radius,
+        "num_train_clips": len(train_paths),
+        "num_val_clips": len(val_paths),
+        "num_train_windows": len(train_dataset),
+        "num_val_windows": len(val_dataset),
+        "best_val_l1": best_val_l1,
+        "final_val": final_val_metrics,
+        "history": history,
+        "example_clip_path": example["clip_path"],
+        "example_start_frame": example["start_frame"],
+        "model_beats_baseline_on_val_l1": final_val_metrics["model_l1"] < final_val_metrics["baseline_l1"],
+        "model_beats_baseline_on_val_dynamic_l1": final_val_metrics["model_dynamic_l1"] < final_val_metrics["baseline_dynamic_l1"],
+    }
+    (args.output_dir / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
 
 
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    clip = make_synthetic_clip(num_frames=args.context_frames + args.predict_frames, image_size=args.image_size)
-
-    context_rgb = torch.from_numpy(clip.video[: args.context_frames]).float().permute(0, 3, 1, 2) / 255.0
-    target_rgb = torch.from_numpy(clip.video[args.context_frames : args.context_frames + args.predict_frames]).float().permute(0, 3, 1, 2) / 255.0
-    target_depth = torch.from_numpy(clip.depth[args.context_frames : args.context_frames + args.predict_frames]).float().unsqueeze(1)
-    context_poses = torch.from_numpy(clip.poses[: args.context_frames]).float()
-    target_poses = torch.from_numpy(clip.poses[args.context_frames : args.context_frames + args.predict_frames]).float()
-    memory_rgbm = build_memory_conditions(clip, args.context_frames, args.predict_frames)
-
-    model = MemoryConditionedWorldModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    context_rgb_b = context_rgb.unsqueeze(0)
-    context_poses_b = context_poses.unsqueeze(0)
-    target_poses_b = target_poses.unsqueeze(0)
-    target_rgb_b = target_rgb.unsqueeze(0)
-    target_depth_b = target_depth.unsqueeze(0)
-    memory_rgbm_b = memory_rgbm.unsqueeze(0)
-
-    for step in range(args.steps):
-        pred_rgb, pred_depth = model(context_rgb_b, context_poses_b, target_poses_b, memory_rgbm_b)
-        loss = masked_l1(pred_rgb, target_rgb_b) + 0.1 * masked_l1(pred_depth, target_depth_b)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if step % 20 == 0 or step == args.steps - 1:
-            with torch.no_grad():
-                current_psnr = float(psnr(pred_rgb, target_rgb_b))
-            print(f"step={step:04d} loss={float(loss.detach()):.5f} psnr={current_psnr:.2f}")
-
-    with torch.no_grad():
-        pred_rgb, _ = model(context_rgb_b, context_poses_b, target_poses_b, memory_rgbm_b)
-    save_strip(target_rgb, pred_rgb[0], args.output_dir / "prediction_strip.png")
-    torch.save(model.state_dict(), args.output_dir / "memory_model.pt")
+    device = pick_device(args.device)
+    print(f"using device={device}")
+    metrics = train_on_exported_clips(args, device)
+    print(json.dumps(metrics, indent=2))
     print(f"saved outputs to {args.output_dir}")
 
 

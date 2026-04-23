@@ -18,11 +18,13 @@ class WriteStats:
 def collect_context_points(
     clip: ClipSample,
     context_frames: int,
+    start_frame: int = 0,
     stride: int = 1,
     ignore_background: bool = True,
 ) -> np.ndarray:
     point_batches: list[np.ndarray] = []
-    for frame_idx in range(context_frames):
+    end_frame = min(start_frame + context_frames, clip.num_frames)
+    for frame_idx in range(start_frame, end_frame):
         depth = clip.depth[frame_idx, ::stride, ::stride].astype(np.float32)
         valid = depth > 0.0
         if clip.segmentations is not None and ignore_background:
@@ -39,6 +41,7 @@ def estimate_memory_spec_from_clip(
     clip: ClipSample,
     context_frames: int,
     resolution: tuple[int, int, int],
+    start_frame: int = 0,
     stride: int = 1,
     ignore_background: bool = True,
     margin_fraction: float = 0.1,
@@ -47,6 +50,7 @@ def estimate_memory_spec_from_clip(
     points = collect_context_points(
         clip=clip,
         context_frames=context_frames,
+        start_frame=start_frame,
         stride=stride,
         ignore_background=ignore_background,
     )
@@ -90,12 +94,14 @@ def accumulate_clip_into_memory(
     clip: ClipSample,
     context_frames: int,
     memory_spec: VoxelGridSpec,
+    start_frame: int = 0,
     stride: int = 1,
     ignore_background: bool = True,
 ) -> tuple[VoxelGrid, list[WriteStats]]:
     memory = VoxelGrid(memory_spec)
     stats: list[WriteStats] = []
-    for frame_idx in range(context_frames):
+    end_frame = min(start_frame + context_frames, clip.num_frames)
+    for frame_idx in range(start_frame, end_frame):
         segmentation = None if clip.segmentations is None else clip.segmentations[frame_idx]
         stats.append(
             write_frame_to_memory(

@@ -22,8 +22,8 @@ class ModelShapeTest(unittest.TestCase):
         context_rgb = torch.rand(2, 4, 3, 64, 64)
         context_poses = torch.eye(4).repeat(2, 4, 1, 1)
         target_poses = torch.eye(4).repeat(2, 2, 1, 1)
-        memory_rgbm = torch.rand(2, 2, 4, 64, 64)
-        rgb, depth = model(context_rgb, context_poses, target_poses, memory_rgbm)
+        memory_condition = torch.rand(2, 2, 5, 64, 64)
+        rgb, depth = model(context_rgb, context_poses, target_poses, memory_condition)
         self.assertEqual(tuple(rgb.shape), (2, 2, 3, 64, 64))
         self.assertEqual(tuple(depth.shape), (2, 2, 1, 64, 64))
 

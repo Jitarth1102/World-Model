@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from world_model.data.clip_dataset import ExportedClipWindowDataset, split_clip_paths
+from world_model.data.clip_dataset import ExportedClipWindowDataset, MemoryConditionedClipWindowDataset, split_clip_paths
 from world_model.data.synthetic import make_synthetic_clip
 
 
@@ -32,6 +32,22 @@ class ExportedClipDatasetTest(unittest.TestCase):
         self.assertTrue(train_paths)
         self.assertTrue(val_paths)
         self.assertEqual(sorted(train_paths + val_paths), sorted(clip_paths))
+
+    def test_memory_dataset_builds_conditions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clip_path = Path(tmpdir) / "clip.npz"
+            make_synthetic_clip(num_frames=8, image_size=64).save_npz(clip_path)
+            dataset = MemoryConditionedClipWindowDataset(
+                clip_paths=[clip_path],
+                context_frames=4,
+                predict_frames=2,
+                image_size=64,
+                memory_grid_resolution=(24, 20, 24),
+            )
+            sample = dataset[0]
+            self.assertEqual(tuple(sample["memory_condition"].shape), (2, 5, 64, 64))
+            self.assertEqual(tuple(sample["target_depth"].shape), (2, 1, 64, 64))
+            self.assertGreater(sample["memory_render_coverage"], 0.0)
 
 
 if __name__ == "__main__":
