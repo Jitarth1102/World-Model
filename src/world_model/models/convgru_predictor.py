@@ -36,8 +36,10 @@ def relative_pose_features(anchor_pose: torch.Tensor, target_pose: torch.Tensor)
 class NoMemoryPredictor(nn.Module):
     """Small RGB future-view predictor used as a carrier for later memory experiments."""
 
-    def __init__(self, image_channels: int = 3, hidden_channels: int = 64, pose_dim: int = 12):
+    def __init__(self, image_channels: int = 3, hidden_channels: int = 64, pose_dim: int = 12, residual_scale: float = 0.25):
         super().__init__()
+        self.image_channels = image_channels
+        self.residual_scale = residual_scale
         self.encoder = SimpleConvEncoder(image_channels, hidden_channels)
         self.pose_proj = nn.Sequential(
             nn.Linear(pose_dim, hidden_channels),
@@ -57,11 +59,15 @@ class NoMemoryPredictor(nn.Module):
     def forward(self, context_rgb: torch.Tensor, context_poses: torch.Tensor, target_poses: torch.Tensor) -> torch.Tensor:
         hidden = self.encode_context(context_rgb)
         anchor_pose = context_poses[:, -1]
+        prev_frame = context_rgb[:, -1]
         predictions = []
         for step_idx in range(target_poses.shape[1]):
             pose_features = relative_pose_features(anchor_pose, target_poses[:, step_idx])
             pose_embedding = self.pose_proj(pose_features)[:, :, None, None]
-            step_input = pose_embedding.expand(-1, -1, hidden.shape[2], hidden.shape[3])
+            prev_encoded = self.encoder(prev_frame)
+            step_input = prev_encoded + pose_embedding.expand(-1, -1, hidden.shape[2], hidden.shape[3])
             hidden = self.temporal_cell(step_input, hidden)
-            predictions.append(torch.sigmoid(self.decoder(hidden)))
+            residual = torch.tanh(self.decoder(hidden)) * self.residual_scale
+            prev_frame = torch.clamp(prev_frame + residual, 0.0, 1.0)
+            predictions.append(prev_frame)
         return torch.stack(predictions, dim=1)
