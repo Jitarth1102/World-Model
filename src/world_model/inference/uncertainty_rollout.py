@@ -88,6 +88,7 @@ def rollout_convgru_uncertainty(
     memory_stride: int,
     memory_splat_radius: int,
     confidence_threshold: float | None,
+    confidence_gamma: float = 1.0,
 ) -> dict[str, object]:
     window = load_window_tensors(
         clip_path=clip_path,
@@ -139,7 +140,7 @@ def rollout_convgru_uncertainty(
         )
         if log_variance is None:
             log_variance = torch.zeros_like(pred_depth)
-        confidence = uncertainty_to_confidence(log_variance)
+        confidence = uncertainty_to_confidence(log_variance, gamma=confidence_gamma)
         rgb_np = prev_frame[0].detach().cpu().permute(1, 2, 0).numpy()
         depth_np = pred_depth[0, 0].detach().cpu().clamp(min=0.0).numpy() * window.depth_scale
         confidence_np = confidence[0, 0].detach().cpu().numpy()
@@ -190,6 +191,7 @@ def rollout_diffusion_uncertainty(
     confidence_threshold: float | None,
     sample_steps: int,
     uncertainty_samples: int,
+    confidence_gamma: float = 1.0,
 ) -> dict[str, object]:
     window = load_window_tensors(
         clip_path=clip_path,
@@ -242,7 +244,7 @@ def rollout_diffusion_uncertainty(
     stacked_predictions = torch.stack(sample_predictions, dim=0)
     mean_prediction = stacked_predictions.mean(dim=0)
     variance_map = stacked_predictions.var(dim=0, unbiased=False).mean(dim=2, keepdim=True)
-    confidence = variance_to_confidence(variance_map)
+    confidence = variance_to_confidence(variance_map, gamma=confidence_gamma)
 
     write_mask_frames = []
     write_fractions = []

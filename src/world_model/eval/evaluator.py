@@ -250,6 +250,7 @@ def evaluate_run(
         return result
     run_payload = _load_run_metrics_payload(spec.run_dir)
     confidence_threshold = float(run_payload.get("write_confidence_threshold", 0.55))
+    confidence_gamma = float(run_payload.get("confidence_gamma", 1.0))
     uncertainty_samples = int(run_payload.get("uncertainty_samples", 4))
 
     rows: list[dict[str, Any]] = []
@@ -273,6 +274,7 @@ def evaluate_run(
                     memory_stride=dataset.memory_stride,
                     memory_splat_radius=dataset.memory_splat_radius,
                     confidence_threshold=confidence_threshold,
+                    confidence_gamma=confidence_gamma,
                 )
                 pred_rgb = rollout["prediction"].unsqueeze(0).to(device)
                 pred_depth = rollout["pred_depth"].unsqueeze(0).to(device)
@@ -300,6 +302,7 @@ def evaluate_run(
                     confidence_threshold=confidence_threshold,
                     sample_steps=spec.sample_steps_eval or 25,
                     uncertainty_samples=uncertainty_samples,
+                    confidence_gamma=confidence_gamma,
                 )
                 pred_rgb = rollout["prediction"].unsqueeze(0).to(device)
                 pred_depth = rollout["pred_depth"].unsqueeze(0).to(device)
