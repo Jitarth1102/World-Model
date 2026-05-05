@@ -1,5 +1,7 @@
 # Student-Scale Persistent 3D World Model
 
+Use the training scripts in `scripts/` for end-to-end runs (`train_convgru_all.sh`, `train_diffusion_all.sh`, `train_full_pipeline.sh`).
+
 This repository implements the first two milestones of the project roadmap:
 
 1. MOVi data ingestion and standardized `ClipSample` export.
@@ -70,14 +72,35 @@ The script converts raw examples into compressed `.npz` clips with:
 
 ### Real MOVi-A export
 
-On macOS arm64, create a Python 3.11 env for the TFDS export path:
+TensorFlow does not ship wheels for very new CPython (for example 3.14). Use **3.11–3.12** for `pip install '.[data]'`, not necessarily the same venv as day-to-day PyTorch work.
+
+**Option A — uv (no conda):**
+
+```bash
+uv venv .venv-movi --python 3.12
+uv pip install --python .venv-movi/bin/python -e ".[data]"
+```
+
+**Option B — conda:**
 
 ```bash
 conda create -y -p ./.conda-movi python=3.11 pip numpy matplotlib pillow
 conda run -p ./.conda-movi pip install '.[data]'
 ```
 
-Export a small real MOVi-A subset:
+Export a small real MOVi-A subset (with **uv** env above):
+
+```bash
+env PYTHONPATH=src .venv-movi/bin/python scripts/prepare_movi.py \
+  --dataset movi_a \
+  --resolution 128x128 \
+  --split train \
+  --limit 50 \
+  --data-dir gs://kubric-public/tfds \
+  --output-dir data/processed/movi_a_128_subset50
+```
+
+With **conda** env:
 
 ```bash
 conda run --no-capture-output -p ./.conda-movi \
@@ -142,69 +165,16 @@ By default the script looks for:
 - `no_memory`
 - `memory_baseline`
 - `memory_strengthened`
-- `diffusion_no_memory`
-- `diffusion_memory`
 - `uncertainty_writes`
 
 The uncertainty row is allowed to be missing until that phase is implemented.
 
-## Diffusion branch
+## Diffusion status
 
-An optional lightweight conditional diffusion branch is available alongside the
-main ConvGRU pipeline. It uses the same exported MOVi windows and the same
-artifact layout.
+We attempted diffusion training with the same MOVi setup, but under current compute limits we did not obtain stable/usable diffusion outputs in time for final reporting.
 
-Smoke-train the no-memory diffusion model:
-
-```bash
-PYTHONPATH=src python3 scripts/train_diffusion.py \
-  --variant no_memory \
-  --manifest data/processed/movi_a_128_subset50/manifest.json \
-  --epochs 1 \
-  --steps 4 \
-  --batch-size 2 \
-  --image-size 64 \
-  --context-frames 4 \
-  --predict-frames 4 \
-  --model-channels 32 \
-  --diffusion-steps 32 \
-  --sample-steps-eval 8 \
-  --eval-max-batches 1 \
-  --max-train-windows-per-clip 2 \
-  --max-val-windows-per-clip 1 \
-  --output-dir outputs/train_diffusion_nomemory_real_movia_subset50_v1
-```
-
-Smoke-train the memory-conditioned diffusion model:
-
-```bash
-PYTHONPATH=src python3 scripts/train_diffusion.py \
-  --variant memory \
-  --manifest data/processed/movi_a_128_subset50/manifest.json \
-  --epochs 1 \
-  --steps 4 \
-  --batch-size 2 \
-  --image-size 64 \
-  --context-frames 4 \
-  --predict-frames 4 \
-  --model-channels 32 \
-  --diffusion-steps 32 \
-  --sample-steps-eval 8 \
-  --eval-max-batches 1 \
-  --max-train-windows-per-clip 2 \
-  --max-val-windows-per-clip 1 \
-  --output-dir outputs/train_diffusion_memory_real_movia_subset50_v1
-```
-
-Run a diffusion rollout:
-
-```bash
-PYTHONPATH=src python3 scripts/rollout_diffusion.py \
-  --checkpoint outputs/train_diffusion_memory_real_movia_subset50_v1/diffusion_model_best.pt \
-  --clip data/processed/movi_a_128_subset50/00000.npz \
-  --start-frame 0 \
-  --output-dir outputs/train_diffusion_memory_real_movia_subset50_v1/rollout_00000
-```
+- Script used for attempts: `scripts/train_diffusion_all.sh`
+- ConvGRU remains the primary reported pipeline/results.
 
 ## Phase 5 evaluation
 
