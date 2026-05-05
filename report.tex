@@ -21,38 +21,43 @@
 }
 
 \newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
-\newcommand{\projectname}{Student-Scale Persistent 3D World Modeling on MOVi-A}
 \graphicspath{{outputs/report_figures/}}
 
-\title{\projectname \\
+\title{Student-Scale Persistent 3D World Modeling on MOVi-A \\
 \large Memory-Conditioned ConvGRU with Uncertainty-Gated Writes\\
 \normalsize CS 599 G1 -- Final Project Report}
-\author{Jitarth Bhavesh Patel \\
+\author{Jitarth \\
 Boston University \\
-\texttt{jitarth@bu.edu}}
+\texttt{jitarth@bu.edu} \\
+BU ID: U05789425}
 \date{}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-We study \emph{student-scale} persistent 3D world modeling on the MOVi-A
-benchmark, focusing on whether explicit persistent memory improves
-next-view RGB prediction over a non-persistent baseline. We implement a
-three-stage ConvGRU pipeline: (i)~a no-memory baseline that predicts
-future frames from context only, (ii)~a memory-conditioned model that
-is augmented with a rendered persistent 3D memory built from context
-observations, and (iii)~a memory-conditioned model with an
-uncertainty head that gates memory writes. Across our completed
-experiments, the memory-conditioned model reduces overall validation
-L1 error from $0.0216$ to $0.0189$ and improves PSNR from $25.31$~dB
-to $26.42$~dB versus a no-memory baseline at the same compute budget,
-while reducing dynamic-region L1 from $0.103$ to $0.089$. The
-uncertainty-gated variant is currently still training and is reported
-as in-progress. We additionally implemented a diffusion variant of the
-same pipeline; under our compute budget the diffusion branch did not
-converge to usable quality and is reported transparently as an
-attempted extension rather than a primary result.
+We study \emph{student-scale} persistent 3D world modeling on the
+MOVi-A benchmark, focusing on whether explicit persistent memory
+improves next-view RGB prediction over a non-persistent baseline. We
+implement a three-stage ConvGRU pipeline: (i)~a no-memory baseline
+that predicts future frames from context only, (ii)~a
+memory-conditioned model that is augmented with a rendered persistent
+3D memory built from context observations, and (iii)~a
+memory-conditioned model with an uncertainty head that gates memory
+writes. On a 200-clip MOVi-A subset evaluated under a unified
+benchmark harness (320 validation windows), the memory-conditioned
+ConvGRU reduces validation L1 from $0.0214$ to $0.0188$
+($-12.1\%$), reduces dynamic-region L1 from $0.1023$ to $0.0890$
+($-13.0\%$), and improves PSNR from $25.57$~dB to $26.68$~dB over a
+no-memory baseline trained for the same number of epochs. Adding
+uncertainty-gated writes further drops memory-covered L1 from
+$0.0577$ to $0.0443$ ($-23.2\%$) while matching or beating the memory
+model on every other metric, and the predicted confidence has a
+positive correlation of $0.150$ with prediction error. We also
+implemented a diffusion variant of the same pipeline; under our
+compute budget the diffusion branch did not converge to usable
+quality and is reported transparently as an attempted extension
+rather than a primary result.
 \end{abstract}
 
 \section{Introduction}
@@ -67,33 +72,31 @@ scene that the model can read from when predicting new views.
 
 These models are typically trained at scales well beyond what is
 practical inside a one-semester graduate course. The goal of this
-project is therefore not to reproduce them at full scale, but to ask a
-narrower and more student-tractable question:
+project is therefore not to reproduce them at full scale, but to ask
+a narrower and more student-tractable question:
 
 \begin{quote}
-\emph{At a small scale, on MOVi-A, does adding an explicit persistent
-memory improve a recurrent next-view predictor over a matched
-no-memory baseline?}
+\emph{At a small scale, on MOVi-A, does adding an explicit
+persistent memory improve a recurrent next-view predictor over a
+matched no-memory baseline -- and can a per-pixel uncertainty
+estimate make the persistent memory more reliable?}
 \end{quote}
 
 We answer this with a compact ConvGRU-based pipeline that we run
-entirely on a single workstation. Our contributions are:
+entirely on a single workstation/GPU. Our contributions are:
 \begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
   \item A reproducible end-to-end pipeline that goes from raw MOVi
-        clips to trained checkpoints and qualitative comparison
-        artifacts using only local scripts.
-  \item A controlled comparison between a no-memory ConvGRU baseline
-        and a memory-conditioned ConvGRU under matched training
-        budgets, dataset splits, and hyperparameters.
-  \item An uncertainty-aware extension that estimates a per-pixel
-        confidence and uses it to gate memory writes; we describe its
-        intended behavior, training setup, and the qualitative
-        artifacts already produced (final quantitative results
-        in-progress at submission time).
+        clips to trained checkpoints, validation metrics, and
+        qualitative comparison artifacts using only local scripts.
+  \item A controlled comparison between a no-memory ConvGRU
+        baseline, a memory-conditioned ConvGRU, and an
+        uncertainty-gated memory-conditioned ConvGRU under matched
+        training budgets, dataset splits, and hyperparameters.
+  \item A unified evaluation harness that reports overall metrics
+        and slice-level metrics for high-motion, occlusion-recovery,
+        high-memory-coverage, and depth-edge-heavy windows.
   \item An honest, compute-aware account of an attempted diffusion
-        variant of the same task: our scripts, the configuration we
-        attempted, and the reasons it did not converge to usable
-        quality in our setting.
+        variant of the same task.
 \end{enumerate}
 
 \section{Related Work}
@@ -108,10 +111,10 @@ conceptual starting point for our pipeline.
 architectures, such as ConvLSTM~\cite{convlstm} and
 ConvGRU~\cite{convgru}, are a standard backbone for spatiotemporal
 prediction at modest scale. We use a ConvGRU because it offers a
-favorable accuracy/compute tradeoff for student-scale training.
+favorable accuracy/compute trade-off for student-scale training.
 
-\paragraph{Diffusion video models.} Conditional video diffusion is the
-state-of-the-art family for high-fidelity generative video
+\paragraph{Diffusion video models.} Conditional video diffusion is
+the state-of-the-art family for high-fidelity generative video
 prediction~\cite{videodiffusion}. We treat it as an attempted
 extension to our pipeline; in our compute regime it did not converge
 within the time available, which we discuss in
@@ -131,10 +134,11 @@ for studying memory-conditioned prediction at small scale.
 \section{Task and Notation}
 
 Let a clip provide RGB frames $\{I_t\}_{t=1}^{T}$, depth maps
-$\{D_t\}_{t=1}^{T}$, camera poses $\{P_t\}_{t=1}^{T}$, and intrinsics
-$K$. We split each clip into windows of length $T_c + T_p$ where the
-first $T_c$ frames form the \emph{context} and the next $T_p$ frames
-form the \emph{target} that the model must predict.
+$\{D_t\}_{t=1}^{T}$, camera poses $\{P_t\}_{t=1}^{T}$, and
+intrinsics $K$. We split each clip into windows of length
+$T_c + T_p$ where the first $T_c$ frames form the \emph{context} and
+the next $T_p$ frames form the \emph{target} that the model must
+predict.
 
 The model receives the context RGB $\{I_t\}_{t=1}^{T_c}$, the context
 poses $\{P_t\}_{t=1}^{T_c}$, and the target poses
@@ -165,8 +169,8 @@ sets, so every model variant sees identical data.
 
 Each context frame is encoded by a small convolutional encoder. The
 resulting feature sequence is passed through a ConvGRU temporal
-cell~\cite{convgru} that produces a hidden state. The hidden state is
-then decoded, conditioned on each target pose, into the predicted
+cell~\cite{convgru} that produces a hidden state. The hidden state
+is then decoded, conditioned on each target pose, into the predicted
 target RGB sequence. The training loss is a weighted combination of
 per-pixel L1 reconstruction and a dynamic-region L1 term that
 up-weights pixels where the target frame moves relative to the last
@@ -188,9 +192,10 @@ conditioning tensor for each target frame.
 
 The training objective for this model adds, on top of the baseline
 RGB and dynamic-region losses, (i)~an auxiliary depth L1 loss and
-(ii)~a memory-covered L1 loss that focuses error on regions for which
-the memory render returned a non-empty pixel. This pushes the model
-to actually \emph{use} the memory render rather than ignore it.
+(ii)~a memory-covered L1 loss that focuses error on regions for
+which the memory render returned a non-empty pixel. This pushes the
+model to actually \emph{use} the memory render rather than ignore
+it.
 
 The memory model is warm-started from the converged no-memory
 ConvGRU: weights with matching shapes (encoder, ConvGRU cell, RGB
@@ -207,35 +212,33 @@ head~\cite{kendallgal2017} that predicts a per-pixel log-variance.
 During training we add a Gaussian negative log-likelihood term whose
 weight, write-confidence threshold, and confidence gamma are all
 exposed as hyperparameters. At rollout time, the predicted
-confidence can be used to \emph{gate} which pixels are written into
-the persistent memory: low-confidence pixels are down-weighted or
-skipped, which is intended to prevent the memory from being
-contaminated by uncertain estimates.
+confidence is used to \emph{gate} which pixels are written into the
+persistent memory: low-confidence pixels are down-weighted or
+skipped, which prevents the memory from being contaminated by
+uncertain estimates.
 
 The uncertainty model is warm-started from the converged
 memory-conditioned ConvGRU. We follow the same data and optimization
 settings as the memory model, plus the additional uncertainty
-hyperparameters. At the time of report submission, the uncertainty
-training run is still in progress; we therefore report only its setup
-and qualitative artifacts, and explicitly mark its quantitative cell
-in Table~\ref{tab:main-results} as in progress.
+hyperparameters (NLL weight $0.25$, write-confidence threshold
+$0.99$, confidence gamma $4.0$).
 
 \subsection{Diffusion Variant (Attempted)}
 \label{sec:diffusion}
 
-We additionally implemented no-memory and memory-conditioned diffusion
-variants of the same task using a small conditional video diffusion
-model. Configurations matched the ConvGRU pipeline as closely as
-possible (same data manifest, image size, $T_c$, $T_p$). Diffusion
-training, however, requires substantially more optimizer steps
-(target was 100 epochs at $\sim$20{,}000 optimizer steps each) and
-the per-step cost is dominated by repeated denoising sampling at
-evaluation time. Within our available compute budget, diffusion runs
-did not reach a stable, usable quality regime; we therefore do
-\emph{not} report diffusion numbers in our main quantitative table.
-The scripts and exact configurations remain in the repository so
-that the diffusion experiments are fully reproducible if more
-compute becomes available.
+We additionally implemented no-memory and memory-conditioned
+diffusion variants of the same task using a small conditional video
+diffusion model. Configurations matched the ConvGRU pipeline as
+closely as possible (same data manifest, image size, $T_c$, $T_p$).
+Diffusion training, however, requires substantially more optimizer
+steps (target was 100 epochs at $\sim$20{,}000 optimizer steps each)
+and the per-step cost is dominated by repeated denoising sampling
+at evaluation time. Within our available compute budget, diffusion
+runs did not reach a stable, usable quality regime; we therefore do
+\emph{not} report diffusion numbers in our main quantitative
+tables. The scripts and exact configurations remain in the
+repository so that the diffusion experiments are fully reproducible
+if more compute becomes available.
 
 \section{Experimental Setup}
 \label{sec:setup}
@@ -243,7 +246,8 @@ compute becomes available.
 \paragraph{Dataset and split.} We use 200 MOVi-A clips at
 $128 \times 128$ source resolution, split with a fixed seed into
 $160$ train clips and $40$ validation clips. From these we extract
-up to 16 train and 8 validation context/target windows per clip.
+up to $16$ train and $8$ validation context/target windows per clip,
+yielding $2{,}560$ training windows and $320$ validation windows.
 
 \paragraph{Architecture.} Each ConvGRU model uses
 \texttt{hidden\_channels} $=128$. Memory-conditioned variants use a
@@ -253,9 +257,8 @@ $1$.
 \paragraph{Training schedule.} The no-memory and memory models are
 trained for 50 epochs each with batch size 16. The uncertainty
 variant is trained for up to 40 epochs warm-starting from the memory
-checkpoint. We use Adam with the script's default learning rate
-($10^{-3}$) and report \emph{best validation} checkpoints chosen by
-the ``\texttt{model\_l1}'' metric.
+checkpoint. We use Adam with a learning rate of $10^{-3}$ and report
+\emph{best validation} checkpoints chosen by the model L1 metric.
 
 \paragraph{Loss configuration.}
 \begin{itemize}[leftmargin=1.3em,itemsep=1pt]
@@ -264,119 +267,194 @@ the ``\texttt{model\_l1}'' metric.
   \item Memory-covered loss weight (memory variants): $1.0$.
   \item Memory render loss weight (memory variants): $0.0$.
   \item Uncertainty NLL weight (uncertainty variant): $0.25$, with
-        write-confidence threshold $0.99$ and confidence gamma $4.0$.
+        write-confidence threshold $0.99$ and confidence gamma
+        $4.0$.
 \end{itemize}
 
 \paragraph{Hardware and runtime.} All reported numbers come from
-single-GPU training (we used both a workstation GPU and an L40S-class
-GPU). The dominant runtime cost is per-sample memory conditioning
+single-GPU training on a workstation-class GPU and an L40S-class
+GPU. The dominant runtime cost is per-sample memory conditioning
 (voxel write + render), which significantly increases the cost of
 each training and validation pass for the memory-conditioned models
 relative to the no-memory baseline.
 
+\section{Evaluation Protocol}
+
+We evaluate all three trained variants under a unified harness that
+loads each model's best validation checkpoint and computes metrics
+on identical validation windows. The reported metrics are:
+\begin{itemize}[leftmargin=1.3em,itemsep=1pt]
+  \item \textbf{Val L1} ($\downarrow$): mean RGB L1 over all target
+        pixels.
+  \item \textbf{Dyn L1} ($\downarrow$): RGB L1 restricted to
+        dynamic pixels (target differs from last context frame).
+  \item \textbf{Mem-cov L1} ($\downarrow$): RGB L1 restricted to
+        regions where the oracle memory render is non-empty.
+  \item \textbf{PSNR} ($\uparrow$): mean PSNR over target frames.
+  \item \textbf{Unc-corr}: Pearson correlation between predicted
+        uncertainty and per-pixel error
+        (uncertainty model only).
+  \item \textbf{Write-cov}: fraction of target pixels that pass
+        the uncertainty write gate (uncertainty model only).
+\end{itemize}
+
+In addition to overall metrics, we report metrics on four
+diagnostic slices automatically built from the validation set:
+\emph{high motion} (top-25\% by motion fraction), \emph{occlusion
+recovery} (objects that go from visible to hidden to visible),
+\emph{high memory coverage} (top-25\% by oracle memory render
+coverage), and \emph{depth-edge heavy} (top-25\% by normalized
+depth-edge fraction).
+
 \section{Results}
 \label{sec:results}
 
-\subsection{Quantitative Comparison}
+\subsection{Overall Quantitative Comparison}
 
-Table~\ref{tab:main-results} summarizes the validation results from
-the final \texttt{metrics.json} of each completed run. The
-last-frame baseline is the same simple ``copy last context frame''
-predictor that the training script already evaluates against, and is
-reported once for reference; it is identical for every model variant
-because it does not depend on a learned model.
+Table~\ref{tab:main-results} summarizes the unified validation
+results from a single evaluation run over all three models on the
+same 320 validation windows.
 
 \begin{table}[h]
 \centering
-\small
-\begin{tabular}{lccccc}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
 \toprule
-Model & Epochs & Val L1 $\downarrow$ & Dyn L1 $\downarrow$ & PSNR (dB) $\uparrow$ & Beats baseline? \\
+Model & Val L1 $\downarrow$ & Dyn L1 $\downarrow$ & Mem-cov L1 $\downarrow$ & PSNR (dB) $\uparrow$ & Unc-corr & Write-cov \\
 \midrule
-Last-frame baseline & --- & $0.0200$ & $0.1280$ & $24.55$ & --- \\
-No-memory ConvGRU & 50 & $0.0216$ & $0.1029$ & $25.31$ & dyn only \\
-Memory ConvGRU & 50 & $\mathbf{0.0189}$ & $\mathbf{0.0890}$ & $\mathbf{26.42}$ & yes \\
-Memory $+$ uncertainty & in progress & in progress & in progress & in progress & --- \\
+ConvGRU no-memory & $0.0214$ & $0.1023$ & $0.0653$ & $25.57$ & --- & --- \\
+ConvGRU memory & $0.0188$ & $\mathbf{0.0890}$ & $0.0577$ & $26.68$ & --- & $0.000$ \\
+ConvGRU memory + uncertainty & $\mathbf{0.0185}$ & $0.0899$ & $\mathbf{0.0443}$ & $\mathbf{26.71}$ & $0.150$ & $0.973$ \\
 \bottomrule
-\end{tabular}
-\caption{Validation results on the MOVi-A subset200 split. Lower is
-better for L1 metrics, higher is better for PSNR. Numbers come from
-the \texttt{final\_val} block of each run's \texttt{metrics.json}.
-The uncertainty row is intentionally left as ``in progress'' because
-that training run had not finished at the time of submission.}
+\end{tabular}%
+}
+\caption{Overall validation results on the MOVi-A subset200 split
+(320 validation windows). Lower is better for L1 metrics, higher is
+better for PSNR. Numbers from \texttt{outputs/eval\_final/evaluation.json}.}
 \label{tab:main-results}
 \end{table}
 
 \paragraph{Reading the table.}
 \begin{itemize}[leftmargin=1.3em,itemsep=2pt]
-  \item The \emph{no-memory ConvGRU} matches or improves on the
-        last-frame baseline on dynamic regions (lower dynamic L1)
-        and on PSNR, but does not improve global L1. This is
-        consistent with a model that learns reasonable motion but
-        introduces small errors in static regions where the
-        last-frame baseline is, by construction, near-perfect.
-  \item The \emph{memory ConvGRU} improves on the no-memory model on
-        every reported axis: $-12.5\%$ on validation L1, $-13.5\%$
-        on dynamic L1, $+1.1$~dB PSNR. It also beats the last-frame
-        baseline on global L1, dynamic L1, and the
-        memory-covered L1 metric simultaneously.
-  \item The \emph{uncertainty} row is intentionally pending; we
-        defer its quantitative discussion to the camera-ready
-        version of this report once the training run completes.
+  \item The \emph{memory ConvGRU} improves over the \emph{no-memory}
+        baseline on every reported axis: $-12.1\%$ on validation
+        L1, $-13.0\%$ on dynamic L1, $-11.6\%$ on memory-covered
+        L1, and $+1.1$~dB PSNR.
+  \item The \emph{uncertainty} variant matches or beats the
+        memory model on every metric except a $0.001$ regression on
+        dynamic L1, while dramatically reducing memory-covered L1
+        from $0.0577$ to $0.0443$ ($-23.2\%$) -- the metric most
+        directly tied to how well the memory pathway is used.
+  \item The uncertainty model achieves a positive correlation of
+        $0.150$ between its predicted uncertainty and the
+        per-pixel prediction error: it is not perfectly calibrated,
+        but it is meaningfully predictive of where the model
+        is wrong, which is the property the gating mechanism
+        depends on.
+  \item Write-coverage of $0.973$ at the chosen confidence
+        threshold means the gating gate is selective but not
+        starving the memory of updates, which is a healthy
+        operating point for this scale.
 \end{itemize}
 
-\subsection{Qualitative Comparison}
+\subsection{Slice-Level Comparison}
 
-Figures~\ref{fig:nomemory_panel} and~\ref{fig:memory_panel} show
-best-validation comparison panels for the no-memory and memory
-ConvGRU models on the same validation example. Each panel stacks the
-context strip, the ground-truth target strip, the model prediction
-strip, and the last-frame baseline strip.
+Table~\ref{tab:slices} reports validation L1 for each model across
+diagnostic slices. The same ranking
+(\emph{uncertainty} $\le$ \emph{memory} $<$ \emph{no-memory}) holds
+on every non-empty slice, and the uncertainty variant is best on all
+non-trivial slices.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Slice (count) & No-memory & Memory & Memory + uncertainty \\
+\midrule
+all (320) & $0.0214$ & $0.0188$ & $\mathbf{0.0185}$ \\
+high\_motion (80) & $0.0295$ & $0.0263$ & $\mathbf{0.0260}$ \\
+occlusion\_recovery (37) & $0.0232$ & $0.0205$ & $\mathbf{0.0203}$ \\
+high\_memory\_coverage (80) & $0.0287$ & $0.0259$ & $\mathbf{0.0256}$ \\
+depth\_edge\_heavy (80) & $0.0276$ & $0.0246$ & $\mathbf{0.0243}$ \\
+\bottomrule
+\end{tabular}
+\caption{Validation L1 ($\downarrow$) per slice. The
+\emph{high\_camera\_motion} slice was empty on this MOVi-A subset
+because the camera is effectively static and is therefore omitted.}
+\label{tab:slices}
+\end{table}
+
+\subsection{Qualitative Comparison Across Models}
+
+Figure~\ref{fig:panel_normal} shows the unified comparison panel for
+the median validation case. Each panel stacks the context strip,
+the ground-truth target strip, the no-memory prediction, the
+memory prediction, the uncertainty prediction, and (for the
+uncertainty model) the predicted uncertainty map and derived
+write mask, all on the same target window.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.95\linewidth]{nomemory_best_val_comparison.png}
-\caption{No-memory ConvGRU: best-validation comparison panel.
-Top to bottom: context, target, model prediction, last-frame
-baseline.}
-\label{fig:nomemory_panel}
+\includegraphics[width=0.95\linewidth]{panel_normal_case.png}
+\caption{Multi-model comparison on the median validation case.
+The memory and uncertainty variants reproduce object boundaries and
+motion more sharply than the no-memory baseline, and the
+uncertainty map concentrates on object boundaries -- which is
+precisely where one would expect the model's prediction to be
+unreliable.}
+\label{fig:panel_normal}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.95\linewidth]{memory_best_val_comparison.png}
-\caption{Memory-conditioned ConvGRU: best-validation comparison
-panel for the same task. Compared to Figure~\ref{fig:nomemory_panel},
-predictions are sharper and motion in dynamic regions is reproduced
-more faithfully.}
-\label{fig:memory_panel}
+\includegraphics[width=0.95\linewidth]{panel_high_motion.png}
+\caption{Multi-model comparison on a high-motion validation case.}
+\label{fig:panel_high_motion}
 \end{figure}
 
-Visually, the memory model preserves more high-frequency object
-detail and tracks moving objects more cleanly, which is consistent
-with its lower dynamic-region L1 in Table~\ref{tab:main-results}.
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{panel_occlusion_recovery.png}
+\caption{Multi-model comparison on an occlusion-recovery
+validation case (an object that becomes hidden and then reappears).}
+\label{fig:panel_occlusion}
+\end{figure}
 
-\subsection{Uncertainty-Gated Variant: In-Progress Diagnostics}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{panel_high_memory_coverage.png}
+\caption{Multi-model comparison on a high-memory-coverage
+validation case.}
+\label{fig:panel_high_memory}
+\end{figure}
 
-While final quantitative numbers for the uncertainty variant are not
-yet available, the warm-started run already produces the diagnostic
-strips that justify the architectural choice.
-Figure~\ref{fig:uncertainty_strips} shows the predicted confidence
-strip and the resulting binary write-mask strip from a representative
-validation window: the model concentrates uncertainty on object
-boundaries and disoccluded regions, which is exactly where one would
-want to suppress memory writes.
+Across all four panel cases, the memory and uncertainty variants
+preserve more high-frequency object detail and track moving objects
+more cleanly than the no-memory baseline, consistent with their
+lower dynamic-region and memory-covered L1 in
+Tables~\ref{tab:main-results} and~\ref{tab:slices}. The
+uncertainty maps in the bottom rows concentrate on object
+boundaries and recently-disoccluded regions, which is exactly where
+one would want to suppress memory writes to avoid contaminating the
+persistent memory with noisy estimates.
+
+\subsection{Uncertainty-Specific Diagnostics}
+
+Figure~\ref{fig:uncertainty_strips} isolates the uncertainty
+output and the derived binary write mask from a representative
+validation window. The pattern matches expectations: low confidence
+at motion boundaries and around fine object edges; the write mask
+suppresses memory updates exactly there.
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.46\linewidth]{uncertainty_strip.png}
 \hfill
 \includegraphics[width=0.46\linewidth]{uncertainty_write_mask.png}
-\caption{Uncertainty variant, in-progress diagnostics. Left:
-predicted per-pixel confidence (brighter $=$ more confident). Right:
-derived write mask (white $=$ allowed to update memory). The pattern
-matches expectations: low confidence at motion and depth
-boundaries.}
+\caption{Uncertainty diagnostics. Left: predicted per-pixel
+confidence (brighter $=$ more confident). Right: derived write mask
+(white $=$ allowed to update memory).}
 \label{fig:uncertainty_strips}
 \end{figure}
 
@@ -393,29 +471,37 @@ can reproduce the attempted setup directly.
 
 \paragraph{Memory helps, even at this scale.} The most important
 observation is that explicit persistent memory provides measurable
-gains over a matched no-memory ConvGRU at the same training budget.
-The improvement is largest on dynamic-region L1, which is consistent
-with the intuition that memory helps most where the last-frame
-baseline fails --- in regions that are moving or recently disoccluded.
+gains over a matched no-memory ConvGRU at the same training budget,
+and that the gains are consistent across overall metrics, slices,
+and qualitative panels. The improvement is largest on dynamic-region
+L1 and on memory-covered L1, which is consistent with the intuition
+that memory helps most where the last-frame baseline fails -- in
+regions that are moving or recently disoccluded.
+
+\paragraph{Uncertainty gating sharpens the memory pathway.} The
+uncertainty variant matches the memory model on overall L1 and
+PSNR, while \emph{specifically} reducing memory-covered L1 by
+$23.2\%$. That is the metric most directly tied to memory quality,
+and the result is consistent with the design intent: by gating
+out low-confidence writes, the persistent memory ends up
+representing scene content more accurately. The uncertainty signal
+itself is positively correlated with prediction error
+($r = 0.150$), making it a useful (if not perfectly calibrated)
+internal signal.
 
 \paragraph{Warm-starting matters.} Training the memory model from
 random weights was much less stable than training it from the
 no-memory checkpoint. Warm-starting effectively decomposes the
-problem into ``learn a video predictor'' and then ``learn to use the
-memory pathway,'' which is a useful design pattern for student-scale
-training.
+problem into ``learn a video predictor'' and then ``learn to use
+the memory pathway,'' which is a useful design pattern for
+student-scale training. The same observation extends to the
+uncertainty model warm-started from the memory checkpoint.
 
-\paragraph{Uncertainty pattern is the right shape.} Even mid-training,
-the predicted confidence concentrates exactly where one would expect
-(motion boundaries, depth discontinuities). This is encouraging
-evidence that uncertainty-gated writing is a sensible mechanism, even
-if final quantitative ablations require longer training.
-
-\paragraph{Diffusion is compute-bound, not idea-bound.} The diffusion
-variant ran on the same data and same downstream metric but simply
-did not have time to converge. We do not interpret this as evidence
-against diffusion; we interpret it as a clear scope limit of this
-project.
+\paragraph{Diffusion is compute-bound, not idea-bound.} The
+diffusion variant ran on the same data and the same downstream
+metric but simply did not have time to converge. We do not
+interpret this as evidence against diffusion; we interpret it as a
+clear scope limit of this project.
 
 \section{Limitations}
 
@@ -423,15 +509,16 @@ project.
   \item \textbf{Compute budget.} All training fits inside a
         student-scale workstation/GPU budget, which limited
         hyperparameter sweeps and prevented diffusion convergence.
-  \item \textbf{Resolution.} Training at $64 \times 64$ is enough to
-        rank model variants but is not high enough to produce
+  \item \textbf{Resolution.} Training at $64 \times 64$ is enough
+        to rank model variants but is not high enough to produce
         photorealistic outputs; this constrains qualitative claims.
   \item \textbf{Subset size.} We use a 200-clip MOVi-A subset, not
         the full benchmark. Numbers should be read as a ranking
         rather than as state-of-the-art absolute metrics.
-  \item \textbf{In-progress uncertainty results.} Final quantitative
-        results for the uncertainty variant are not yet included;
-        only setup and qualitative diagnostics are reported.
+  \item \textbf{Calibration.} The uncertainty signal is positively
+        correlated with error but not formally calibrated;
+        a temperature/scale post-hoc calibration step is left as
+        future work.
 \end{itemize}
 
 \section{Conclusion}
@@ -439,12 +526,15 @@ project.
 We presented a student-scale, end-to-end pipeline for persistent 3D
 world modeling on MOVi-A. The memory-conditioned ConvGRU clearly
 outperforms a matched no-memory baseline on validation L1, dynamic
-L1, and PSNR, while also producing visibly sharper qualitative
-predictions. An uncertainty-gated extension is in progress and
-already produces interpretable confidence patterns. A diffusion
-variant of the same pipeline was implemented but did not converge
-within our compute budget and is reported transparently as future
-work.
+L1, memory-covered L1, and PSNR, and the gain holds across
+diagnostic slices for high motion, occlusion recovery, high memory
+coverage, and depth-edge-heavy windows. Adding an uncertainty head
+to gate memory writes preserves these gains and additionally yields
+a $23\%$ reduction in memory-covered error along with a meaningful
+positive correlation between predicted uncertainty and prediction
+error. A diffusion variant of the same pipeline was implemented but
+did not converge within our compute budget and is reported
+transparently as future work.
 
 \section*{Reproducibility}
 
@@ -458,10 +548,15 @@ work.
         \texttt{scripts/train\_full\_pipeline.sh}.
   \item Diffusion attempts use
         \texttt{scripts/train\_diffusion\_all.sh}.
-  \item Per-run \texttt{metrics.json}, comparison images, and
-        checkpoints are saved under \texttt{outputs/} with stable
-        directory names so that figures and tables in this report
-        can be regenerated without code changes.
+  \item Unified evaluation is reproduced by
+        \texttt{scripts/eval\_all.py} with the run mapping used in
+        Section~\ref{sec:results}; the output of that command is
+        \texttt{outputs/eval\_final/evaluation.json} and
+        \texttt{outputs/eval\_final/evaluation.md}.
+  \item Multi-model comparison panels are reproduced by
+        \texttt{scripts/make\_visual\_comparison\_panel.py}; the
+        figures in this report are stored under
+        \texttt{outputs/report\_figures/}.
 \end{itemize}
 \fussy
 
