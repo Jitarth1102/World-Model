@@ -38,69 +38,83 @@ BU ID: U05789425}
 \maketitle
 
 \begin{abstract}
-We study \emph{student-scale} persistent 3D world modeling on the
-MOVi-A benchmark, focusing on whether explicit persistent memory
-improves next-view RGB prediction over a non-persistent baseline. We
-implement a three-stage ConvGRU pipeline: (i)~a no-memory baseline
-that predicts future frames from context only, (ii)~a
-memory-conditioned model that is augmented with a rendered persistent
-3D memory built from context observations, and (iii)~a
-memory-conditioned model with an uncertainty head that gates memory
-writes. On a 200-clip MOVi-A subset evaluated under a unified
-benchmark harness (320 validation windows), the memory-conditioned
-ConvGRU reduces validation L1 from $0.0214$ to $0.0188$
-($-12.1\%$), reduces dynamic-region L1 from $0.1023$ to $0.0890$
-($-13.0\%$), and improves PSNR from $25.57$~dB to $26.68$~dB over a
-no-memory baseline trained for the same number of epochs. Adding
-uncertainty-gated writes further drops memory-covered L1 from
-$0.0577$ to $0.0443$ ($-23.2\%$) while matching or beating the memory
-model on every other metric, and the predicted confidence has a
-positive correlation of $0.150$ with prediction error. For
-completeness we additionally implemented a diffusion variant of the
-same pipeline; we discuss why a deterministic recurrent backbone
-gives a cleaner answer to ``does persistent memory help?'' and
-report the diffusion variant as an exploratory complement rather
-than a primary result.
+Long-horizon visual prediction in 3D scenes is fundamentally limited
+by what a model can remember about previously observed views.
+Recent work argues that maintaining an explicit, geometrically
+grounded persistent memory is essential for view-consistent
+forecasting, but reproducing the underlying mechanism at full
+production scale is impractical in a course-project setting. We
+therefore study a \emph{student-scale} replication of the
+persistent-memory mechanism on the MOVi-A benchmark and ask whether
+the memory pathway alone yields measurable gains under matched
+training budgets. We instantiate a three-stage ConvGRU pipeline:
+(i)~a no-memory baseline that predicts future frames from context
+only, (ii)~a memory-conditioned model augmented with a rendered
+persistent 3D voxel memory constructed from context observations,
+and (iii)~a memory-conditioned model with a heteroscedastic
+uncertainty head that gates memory writes. Evaluated under a unified
+harness on $320$ validation windows from a $200$-clip MOVi-A subset,
+the memory-conditioned ConvGRU reduces validation
+L1 from $0.0214$ to $0.0188$ ($-12.1\%$), reduces dynamic-region
+L1 from $0.1023$ to $0.0890$ ($-13.0\%$), and improves PSNR from
+$25.57$~dB to $26.68$~dB relative to the no-memory baseline at the
+same number of epochs. Adding uncertainty-gated writes further
+reduces memory-covered L1 from $0.0577$ to $0.0443$ ($-23.2\%$)
+while matching or improving every other metric, and the predicted
+confidence is positively correlated with per-pixel error
+($r{=}0.150$). A conditional video-diffusion variant of the same
+pipeline is documented for completeness; we argue on methodological
+grounds that a deterministic recurrent backbone provides a cleaner
+isolation of the memory pathway, and we therefore treat diffusion
+as an exploratory complement rather than a primary result.
 \end{abstract}
 
 \section{Introduction}
-Long-horizon visual prediction in 3D scenes requires a model to keep
-track of what it has already seen, where the camera was, and how the
-world looked at earlier time steps. Purely frame-local predictors and
-even short-context recurrent predictors collapse under viewpoint
-change, occlusion, and accumulating uncertainty. Recent work on
-\emph{persistent} 3D world models~\cite{persistent3dworld} addresses
-this by maintaining an explicit, geometrically grounded memory of the
-scene that the model can read from when predicting new views.
 
-These models are typically trained at scales well beyond what is
-practical inside a one-semester graduate course. The goal of this
-project is therefore not to reproduce them at full scale, but to ask
-a narrower and more student-tractable question:
+Predicting future views of a 3D scene requires a model to remember
+not only what it observed in the immediate past but \emph{where} in
+the world those observations were located. Frame-local predictors,
+and even short-context recurrent predictors, degrade rapidly under
+viewpoint change, occlusion, and the accumulation of prediction
+error over time. Recent work on \emph{persistent 3D world
+models}~\cite{persistent3dworld} addresses this limitation by
+maintaining an explicit, geometrically grounded memory of the
+scene from which target views can be queried.
+
+Because such models are typically trained at scales well beyond
+what is practical in a one-semester graduate course, our objective
+is not full reproduction but a controlled replication of the
+underlying mechanism at student scale. Concretely, we ask:
 
 \begin{quote}
-\emph{At a small scale, on MOVi-A, does adding an explicit
-persistent memory improve a recurrent next-view predictor over a
-matched no-memory baseline -- and can a per-pixel uncertainty
-estimate make the persistent memory more reliable?}
+\emph{On a small MOVi-A subset and under matched training budgets,
+does adding an explicit persistent memory improve a recurrent
+next-view predictor over a no-memory baseline, and does a
+per-pixel uncertainty estimate further increase the reliability of
+the persistent memory?}
 \end{quote}
 
-We answer this with a compact ConvGRU-based pipeline that we run
-entirely on a single workstation/GPU. Our contributions are:
+We instantiate this question through a compact ConvGRU-based
+pipeline that runs end-to-end on a single workstation-class GPU.
+Our contributions are:
 \begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
-  \item A reproducible end-to-end pipeline that goes from raw MOVi
-        clips to trained checkpoints, validation metrics, and
-        qualitative comparison artifacts using only local scripts.
-  \item A controlled comparison between a no-memory ConvGRU
-        baseline, a memory-conditioned ConvGRU, and an
+  \item \textbf{Reproducible pipeline.} An end-to-end implementation
+        from raw MOVi clip export through trained checkpoints,
+        validation metrics, and qualitative comparison artifacts,
+        executable from local scripts without cluster access.
+  \item \textbf{Controlled comparison.} A side-by-side evaluation of
+        a no-memory ConvGRU, a memory-conditioned ConvGRU, and an
         uncertainty-gated memory-conditioned ConvGRU under matched
-        training budgets, dataset splits, and hyperparameters.
-  \item A unified evaluation harness that reports overall metrics
-        and slice-level metrics for high-motion, occlusion-recovery,
-        high-memory-coverage, and depth-edge-heavy windows.
-  \item An exploratory diffusion variant of the same task,
-        documented end-to-end and contrasted with the recurrent
-        backbone in terms of methodological fit.
+        data splits, optimisation settings, and training budgets.
+  \item \textbf{Slice-level evaluation harness.} A unified
+        evaluation procedure reporting overall validation metrics
+        and four diagnostic slices: high motion, occlusion
+        recovery, high memory coverage, and depth-edge-heavy
+        windows.
+  \item \textbf{Exploratory diffusion variant.} An end-to-end
+        documented conditional video-diffusion variant, contrasted
+        with the recurrent backbone in
+        Section~\ref{sec:backbone_choice} on methodological grounds.
 \end{enumerate}
 
 \section{Related Work}
@@ -155,75 +169,62 @@ receive a rendered memory tensor (Section~\ref{sec:memory_model}).
 In all our final runs we use $T_c = T_p = 4$ and an image resolution
 of $64 \times 64$.
 
-\section{Choice of Backbone: Why ConvGRU?}
+\section{Backbone Selection Rationale}
 \label{sec:backbone_choice}
 
-The reference paper~\cite{persistent3dworld} introduces a particular
-\emph{mechanism} -- write observations into a persistent 3D memory
-and query that memory from new views -- and argues that this
-mechanism is the source of long-horizon consistency. To replicate
-that claim faithfully we want a backbone that lets us isolate the
-contribution of \emph{the memory pathway itself}, rather than
-entangling it with a generative prior. We chose a ConvGRU recurrent
-backbone for the following reasons.
+The reference work~\cite{persistent3dworld} introduces a specific
+\emph{mechanism} -- writing observations into a persistent 3D
+memory and querying that memory from novel viewpoints -- and
+attributes long-horizon view consistency to this mechanism rather
+than to the underlying generative model. A faithful replication of
+that claim therefore requires a backbone that allows the memory
+pathway to be isolated from confounding sources of variation. We
+adopt a ConvGRU recurrent backbone for four complementary reasons.
 
-\paragraph{Spatiotemporal recurrence matches the memory mechanism.}
-Persistent memory writes naturally factor as a per-timestep update
-over a context sequence, and queries from new views naturally factor
-as a per-target-frame read. ConvGRUs~\cite{convgru} are a canonical
+\paragraph{Alignment with the memory mechanism.}
+Persistent-memory writes are naturally expressed as per-timestep
+updates over a context sequence, and queries from new views as
+per-target-frame reads. ConvGRUs~\cite{convgru} provide a canonical
 spatiotemporal recurrent backbone whose hidden state evolves at the
-same temporal granularity. This makes it straightforward to insert
-a per-frame memory-render conditioning tensor at exactly the right
-place in the computation graph (Section~\ref{sec:memory_model}),
-and to keep the rest of the architecture identical to the no-memory
-baseline.
+same temporal granularity, which permits the rendered memory
+condition to be injected directly at the per-frame fusion stage
+(Section~\ref{sec:memory_model}) while leaving the remainder of
+the architecture identical to the no-memory baseline.
 
-\paragraph{Clean ablatability of the memory pathway.}
-Because the no-memory and memory-conditioned models share the same
-encoder, recurrent cell, and RGB decoder, we can warm-start the
-memory model from the converged no-memory checkpoint and treat the
-memory pathway as a \emph{single, well-defined addition}. Any change
-in validation L1, dynamic L1, or memory-covered L1 between these
-two runs is therefore directly attributable to the memory pathway,
-which is exactly the claim of the reference paper.
+\paragraph{Ablatability of the memory pathway.}
+Since the no-memory and memory-conditioned models share encoder,
+recurrent cell, and RGB decoder, the memory model can be
+warm-started from the converged no-memory checkpoint, and the
+memory pathway becomes a single, well-defined modification. Any
+change in validation L1, dynamic L1, or memory-covered L1 between
+the two configurations is therefore directly attributable to the
+memory pathway -- which is precisely the claim under test.
 
 \paragraph{Deterministic, single-pass evaluation.}
-ConvGRU produces deterministic outputs in one forward pass, so the
-metrics we report (L1, dynamic L1, memory-covered L1, PSNR) measure
-the prediction itself, not a sampling distribution. Generative
-backbones like diffusion produce a distribution of samples per query
-and require multi-step denoising at evaluation time, which makes it
-much harder to attribute changes in metrics to the memory mechanism
-versus to the sampling procedure. For a project whose central
-question is ``does persistent memory help?'', a deterministic
-backbone gives a much cleaner answer.
+ConvGRU produces deterministic predictions in one forward pass, so
+the reported metrics (L1, dynamic L1, memory-covered L1, PSNR)
+characterise the prediction itself rather than a sampling
+distribution. Generative backbones such as conditional video
+diffusion produce a distribution of plausible samples per query
+and require multi-step denoising at evaluation time, which
+introduces additional variance and complicates attribution of
+metric changes to the memory pathway as opposed to the sampler.
 
-\paragraph{Fits naturally with explicit per-pixel uncertainty.}
-The uncertainty extension (Section~\ref{sec:uncertainty}) adds a
-heteroscedastic head~\cite{kendallgal2017} that predicts a
-per-pixel log-variance. This composes cleanly with a deterministic
-recurrent backbone: confidence is a function of the same features
-that produce the prediction, and the resulting write-mask gates
-memory updates at the granularity at which the memory is queried.
-Combining a heteroscedastic head with a denoising diffusion sampler
-would conflate epistemic noise from the diffusion sampler with the
-genuine per-pixel uncertainty signal, again obscuring the variable
-of interest.
+\paragraph{Compositionality with per-pixel uncertainty.}
+The uncertainty extension (Section~\ref{sec:uncertainty}) employs
+a heteroscedastic head~\cite{kendallgal2017} that predicts a
+per-pixel log-variance over the same hidden features used for
+prediction. This composes naturally with a deterministic backbone:
+the resulting confidence map gates memory updates at the same
+granularity at which the memory is queried. Combining a
+heteroscedastic head with a denoising diffusion sampler would
+entangle aleatoric uncertainty with sampler-induced variability,
+weakening the gating signal.
 
-\paragraph{Implementation footprint.}
-ConvGRU is a well-understood, lightweight architecture with low
-parameter count and clear training dynamics. This made it possible
-to keep the entire pipeline (encoder, recurrence, memory rendering,
-uncertainty head, training scripts, evaluation harness, and
-visualization code) inside a single, end-to-end reproducible
-codebase that anyone with a modest workstation can re-run, which is
-the project's reproducibility commitment.
-
-For completeness, we additionally implemented a conditional video
-diffusion variant of the same task and report the outcome
-transparently in Section~\ref{sec:diffusion}; the diffusion variant
-is an exploratory complement to the ConvGRU pipeline rather than a
-substitute for it.
+For completeness, a conditional video-diffusion variant of the same
+task is implemented and documented in Section~\ref{sec:diffusion};
+it is treated as an exploratory complement to the ConvGRU pipeline
+rather than a substitute.
 
 \section{Method}
 \label{sec:method}
@@ -240,7 +241,7 @@ branch and the memory-encoder/fuse path; the memory variant uses
 all solid arrows; the uncertainty variant additionally uses the
 heteroscedastic head and the dashed write-gating loop.
 
-\begin{figure}[h]
+\begin{figure}[!htb]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
@@ -625,7 +626,7 @@ Table~\ref{tab:main-results} summarizes the unified validation
 results from a single evaluation run over all three models on the
 same 320 validation windows.
 
-\begin{table}[h]
+\begin{table}[!htb]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccc}
@@ -644,27 +645,26 @@ better for PSNR. Numbers from \texttt{outputs/eval\_final/evaluation.json}.}
 \label{tab:main-results}
 \end{table}
 
-\paragraph{Reading the table.}
+\paragraph{Analysis.}
 \begin{itemize}[leftmargin=1.3em,itemsep=2pt]
   \item The \emph{memory ConvGRU} improves over the \emph{no-memory}
-        baseline on every reported axis: $-12.1\%$ on validation
-        L1, $-13.0\%$ on dynamic L1, $-11.6\%$ on memory-covered
-        L1, and $+1.1$~dB PSNR.
-  \item The \emph{uncertainty} variant matches or beats the
-        memory model on every metric except a $0.001$ regression on
-        dynamic L1, while dramatically reducing memory-covered L1
+        baseline on every reported axis: $-12.1\%$ on overall
+        validation L1, $-13.0\%$ on dynamic L1, $-11.6\%$ on
+        memory-covered L1, and $+1.11$~dB PSNR.
+  \item The \emph{uncertainty} variant matches or improves the
+        memory model on every metric except a marginal $0.001$
+        increase in dynamic L1, while reducing memory-covered L1
         from $0.0577$ to $0.0443$ ($-23.2\%$) -- the metric most
-        directly tied to how well the memory pathway is used.
-  \item The uncertainty model achieves a positive correlation of
-        $0.150$ between its predicted uncertainty and the
-        per-pixel prediction error: it is not perfectly calibrated,
-        but it is meaningfully predictive of where the model
-        is wrong, which is the property the gating mechanism
-        depends on.
-  \item Write-coverage of $0.973$ at the chosen confidence
-        threshold means the gating gate is selective but not
-        starving the memory of updates, which is a healthy
-        operating point for this scale.
+        directly tied to how faithfully the memory pathway is used.
+  \item The predicted log-variance is positively correlated with
+        per-pixel prediction error ($r{=}0.150$). Although not
+        formally calibrated, the signal is meaningfully predictive
+        of regions where the model is uncertain, which is the
+        property the gating mechanism relies on.
+  \item A write-coverage of $0.973$ at the chosen threshold
+        indicates that the gate is selective without preventing
+        the persistent memory from being updated, which is a
+        desirable operating point at this scale.
 \end{itemize}
 
 \subsection{Slice-Level Comparison}
@@ -675,7 +675,7 @@ diagnostic slices. The same ranking
 on every non-empty slice, and the uncertainty variant is best on all
 non-trivial slices.
 
-\begin{table}[h]
+\begin{table}[!htb]
 \centering
 \small
 \begin{tabular}{lccc}
@@ -704,7 +704,7 @@ memory prediction, the uncertainty prediction, and (for the
 uncertainty model) the predicted uncertainty map and derived
 write mask, all on the same target window.
 
-\begin{figure}[h]
+\begin{figure}[!htb]
 \centering
 \includegraphics[width=0.95\linewidth]{panel_normal_case.png}
 \caption{Multi-model comparison on the median validation case.
@@ -716,14 +716,14 @@ unreliable.}
 \label{fig:panel_normal}
 \end{figure}
 
-\begin{figure}[h]
+\begin{figure}[!htb]
 \centering
 \includegraphics[width=0.95\linewidth]{panel_high_motion.png}
 \caption{Multi-model comparison on a high-motion validation case.}
 \label{fig:panel_high_motion}
 \end{figure}
 
-\begin{figure}[h]
+\begin{figure}[!htb]
 \centering
 \includegraphics[width=0.95\linewidth]{panel_occlusion_recovery.png}
 \caption{Multi-model comparison on an occlusion-recovery
@@ -731,7 +731,7 @@ validation case (an object that becomes hidden and then reappears).}
 \label{fig:panel_occlusion}
 \end{figure}
 
-\begin{figure}[h]
+\begin{figure}[!htb]
 \centering
 \includegraphics[width=0.95\linewidth]{panel_high_memory_coverage.png}
 \caption{Multi-model comparison on a high-memory-coverage
@@ -757,7 +757,7 @@ validation window. The pattern matches expectations: low confidence
 at motion boundaries and around fine object edges; the write mask
 suppresses memory updates exactly there.
 
-\begin{figure}[h]
+\begin{figure}[!htb]
 \centering
 \includegraphics[width=0.46\linewidth]{uncertainty_strip.png}
 \hfill
@@ -782,77 +782,95 @@ is documented end-to-end and can be re-run for follow-up work.
 
 \section{Discussion}
 
-\paragraph{Memory helps, even at this scale.} The most important
-observation is that explicit persistent memory provides measurable
-gains over a matched no-memory ConvGRU at the same training budget,
-and that the gains are consistent across overall metrics, slices,
-and qualitative panels. The improvement is largest on dynamic-region
-L1 and on memory-covered L1, which is consistent with the intuition
-that memory helps most where the last-frame baseline fails -- in
-regions that are moving or recently disoccluded.
+\paragraph{Persistent memory yields measurable gains at student
+scale.} The principal empirical observation is that explicit
+persistent memory provides consistent, attributable improvements
+over a matched no-memory ConvGRU at the same training budget. The
+gains are most pronounced on dynamic-region L1 and on
+memory-covered L1, which is consistent with the hypothesis that
+memory contributes most in regions where the last-frame baseline is
+weakest -- namely moving and recently-disoccluded content.
 
 \paragraph{Uncertainty gating sharpens the memory pathway.} The
-uncertainty variant matches the memory model on overall L1 and
-PSNR, while \emph{specifically} reducing memory-covered L1 by
-$23.2\%$. That is the metric most directly tied to memory quality,
-and the result is consistent with the design intent: by gating
-out low-confidence writes, the persistent memory ends up
-representing scene content more accurately. The uncertainty signal
-itself is positively correlated with prediction error
-($r = 0.150$), making it a useful (if not perfectly calibrated)
-internal signal.
+uncertainty variant preserves the gains of the memory model on
+overall L1 and PSNR, and additionally reduces memory-covered L1 by
+$23.2\%$, the metric most directly tied to the fidelity of the
+persistent memory itself. The predicted log-variance is positively
+correlated with per-pixel error ($r{=}0.150$), suggesting that
+even without formal calibration the signal localises uncertain
+regions accurately enough to be useful as a gating mask.
 
-\paragraph{Warm-starting matters.} Training the memory model from
-random weights was much less stable than training it from the
-no-memory checkpoint. Warm-starting effectively decomposes the
-problem into ``learn a video predictor'' and then ``learn to use
-the memory pathway,'' which is a useful design pattern for
-student-scale training. The same observation extends to the
-uncertainty model warm-started from the memory checkpoint.
+\paragraph{Sequential warm-starting stabilises training.}
+Training the memory model from random weights produced markedly
+less stable optimisation than warm-starting from the converged
+no-memory checkpoint, and the same pattern held for warm-starting
+the uncertainty model from the memory checkpoint. Sequential
+warm-starting effectively decomposes the optimisation problem into
+``learn a recurrent video predictor'' followed by ``learn to use
+the memory pathway,'' which we found to be an effective design
+pattern at this scale.
 
-\paragraph{ConvGRU is the right backbone for the question.} The
-project's central claim is about the \emph{memory pathway}, not
-about the generative model on top of it. A deterministic recurrent
-backbone makes that contribution easy to isolate, easy to ablate,
-and easy to evaluate with a single-pass metric. The diffusion
-variant remains a valid generative complement, but it answers a
-different question.
+\paragraph{Methodological coherence of the recurrent backbone.}
+The empirical findings reinforce the rationale of
+Section~\ref{sec:backbone_choice}: because the no-memory and
+memory variants share an identical predictor and the uncertainty
+head is itself deterministic, every metric movement we report is
+attributable to the memory pathway and to the gating mechanism
+specifically. The diffusion variant, while a valid generative
+complement, addresses a different research question.
 
 \section{Limitations}
 
+\sloppy
 \begin{itemize}[leftmargin=1.3em,itemsep=2pt]
-  \item \textbf{Scope.} This project deliberately replicates the
-        memory mechanism of the reference paper, not the full
-        production training stack; absolute numbers should be read
-        as a ranking under matched settings rather than as
+  \item \textbf{Replication scope.} This work intentionally
+        replicates only the memory mechanism of the reference
+        architecture~\cite{persistent3dworld}, not the full
+        production-scale training pipeline; reported metrics are
+        comparative under matched settings rather than absolute
         state-of-the-art.
-  \item \textbf{Resolution.} Training at $64 \times 64$ is enough
-        to rank model variants but is not high enough to produce
-        photorealistic outputs; this constrains qualitative claims.
-  \item \textbf{Subset size.} We use a 200-clip MOVi-A subset, not
-        the full benchmark. Numbers should be read as a ranking
-        rather than as state-of-the-art absolute metrics.
-  \item \textbf{Calibration.} The uncertainty signal is positively
-        correlated with error but not formally calibrated;
-        a temperature/scale post-hoc calibration step is left as
+  \item \textbf{Spatial resolution.} Training at $64\times64$ is
+        sufficient to rank model variants reliably but is too low
+        to support photorealistic qualitative claims.
+  \item \textbf{Uncertainty calibration.} The predicted
+        log-variance is positively correlated with prediction error
+        but is not formally calibrated; a post-hoc
+        temperature-scale or isotonic calibration step is left as
         future work.
+  \item \textbf{Camera motion.} The MOVi-A subset used here has
+        effectively static cameras, so the
+        \texttt{high\_camera\_motion} slice is empty by construction.
+        Evaluating on a dataset variant with non-trivial camera
+        motion would test whether the persistent-memory gains
+        generalise beyond object-motion regimes.
 \end{itemize}
+\fussy
 
-\section{Conclusion}
+\section{Conclusion and Future Work}
 
-We presented a student-scale, end-to-end pipeline for persistent 3D
-world modeling on MOVi-A. The memory-conditioned ConvGRU clearly
-outperforms a matched no-memory baseline on validation L1, dynamic
-L1, memory-covered L1, and PSNR, and the gain holds across
-diagnostic slices for high motion, occlusion recovery, high memory
-coverage, and depth-edge-heavy windows. Adding an uncertainty head
-to gate memory writes preserves these gains and additionally yields
-a $23\%$ reduction in memory-covered error along with a meaningful
-positive correlation between predicted uncertainty and prediction
-error. A diffusion variant of the same pipeline is implemented and
-documented as an exploratory complement, but the deterministic
-ConvGRU backbone is the right tool for isolating the memory
-pathway and is reported as the primary result of this project.
+We have presented a student-scale, end-to-end replication of the
+persistent-memory mechanism for 3D world modeling on the MOVi-A
+benchmark. Across overall validation metrics and four diagnostic
+slices, the memory-conditioned ConvGRU consistently improves upon a
+matched no-memory baseline, and an uncertainty-gated extension
+further reduces memory-covered error by $23\%$ while producing a
+predicted-uncertainty signal that positively correlates with
+per-pixel error. The deterministic recurrent backbone is shown,
+both methodologically and empirically, to be a suitable carrier for
+isolating the contribution of the memory pathway under a controlled
+experimental protocol.
+
+Several directions follow naturally from this work. First, the
+predicted uncertainty is informative but uncalibrated; post-hoc
+calibration is expected to tighten the connection between
+confidence and reliability of memory writes. Second, the present
+study is conducted with effectively static cameras; extending the
+evaluation to a benchmark with camera motion would verify whether
+the gains generalise to viewpoint-induced occlusion. Third, the
+exploratory diffusion variant could be revisited with a sampler
+designed to interact with persistent memory directly, which would
+allow a fair like-for-like comparison against the recurrent
+backbone studied here.
 
 \section*{Reproducibility}
 
@@ -880,29 +898,42 @@ pathway and is reported as the primary result of this project.
 
 \begin{thebibliography}{9}
 \bibitem{persistent3dworld}
-Anonymous authors. ``Learning 3D Persistent Embodied World Models.''
-Reference paper, 2025.
+\emph{Learning 3D Persistent Embodied World Models}.
+Reference manuscript, 2025. (Project reference paper used as the
+methodological starting point for this work.)
 
 \bibitem{kubric}
-Greff, Klaus, et al. ``Kubric: a scalable dataset generator.''
-\emph{CVPR}, 2022.
+K.~Greff, F.~Belletti, L.~Beyer, et al.
+``Kubric: A Scalable Dataset Generator.''
+\emph{Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR)}, 2022.
 
 \bibitem{convlstm}
-Shi, Xingjian, et al. ``Convolutional LSTM Network: A Machine
-Learning Approach for Precipitation Nowcasting.''
-\emph{NeurIPS}, 2015.
+X.~Shi, Z.~Chen, H.~Wang, D.-Y.~Yeung, W.-K.~Wong, and W.-c.~Woo.
+``Convolutional LSTM Network: A Machine Learning Approach for
+Precipitation Nowcasting.''
+\emph{Advances in Neural Information Processing Systems (NeurIPS)},
+2015.
 
 \bibitem{convgru}
-Ballas, Nicolas, et al. ``Delving Deeper into Convolutional Networks
-for Learning Video Representations.'' \emph{ICLR}, 2016.
+N.~Ballas, L.~Yao, C.~Pal, and A.~Courville.
+``Delving Deeper into Convolutional Networks for Learning Video
+Representations.''
+\emph{International Conference on Learning Representations (ICLR)},
+2016.
 
 \bibitem{videodiffusion}
-Ho, Jonathan, et al. ``Video Diffusion Models.''
-\emph{NeurIPS}, 2022.
+J.~Ho, T.~Salimans, A.~Gritsenko, W.~Chan, M.~Norouzi, and D.~Fleet.
+``Video Diffusion Models.''
+\emph{Advances in Neural Information Processing Systems (NeurIPS)},
+2022.
 
 \bibitem{kendallgal2017}
-Kendall, Alex, and Yarin Gal. ``What Uncertainties Do We Need in
-Bayesian Deep Learning for Computer Vision?'' \emph{NeurIPS}, 2017.
+A.~Kendall and Y.~Gal.
+``What Uncertainties Do We Need in Bayesian Deep Learning for
+Computer Vision?''
+\emph{Advances in Neural Information Processing Systems (NeurIPS)},
+2017.
 \end{thebibliography}
 
 \end{document}
