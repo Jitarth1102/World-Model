@@ -3,5 +3,6 @@ __pycache__/
 .DS_Store
 .conda-movi/
 .venv/
+.venv-movi/
 outputs/
 data/
