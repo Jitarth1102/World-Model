@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-uncertainty", action="store_true")
     parser.add_argument("--uncertainty-loss-weight", type=float, default=0.25)
     parser.add_argument("--write-confidence-threshold", type=float, default=0.55)
+    parser.add_argument("--confidence-gamma", type=float, default=1.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/train_memory_real"))
     return parser.parse_args()
@@ -315,6 +316,7 @@ def evaluate_model(
     memory_stride: int,
     memory_splat_radius: int,
     write_confidence_threshold: float,
+    confidence_gamma: float,
 ) -> tuple[dict[str, float], dict[str, torch.Tensor | str | int | float]]:
     model.eval()
     total_model_l1 = 0.0
@@ -355,6 +357,7 @@ def evaluate_model(
                     memory_stride=memory_stride,
                     memory_splat_radius=memory_splat_radius,
                     confidence_threshold=write_confidence_threshold,
+                    confidence_gamma=confidence_gamma,
                 )
                 window = rollout["window"]
                 context_rgb = window.context_rgb
@@ -593,6 +596,7 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
             memory_stride=args.memory_stride,
             memory_splat_radius=args.memory_splat_radius,
             write_confidence_threshold=args.write_confidence_threshold,
+            confidence_gamma=args.confidence_gamma,
         )
         epoch_metrics: dict[str, float | int] = {
             "epoch": epoch,
@@ -633,6 +637,7 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
         memory_stride=args.memory_stride,
         memory_splat_radius=args.memory_splat_radius,
         write_confidence_threshold=args.write_confidence_threshold,
+        confidence_gamma=args.confidence_gamma,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.output_dir / "memory_model_last.pt")
@@ -661,6 +666,7 @@ def train_on_exported_clips(args: argparse.Namespace, device: torch.device) -> d
         "enable_uncertainty": args.enable_uncertainty,
         "uncertainty_loss_weight": args.uncertainty_loss_weight,
         "write_confidence_threshold": args.write_confidence_threshold,
+        "confidence_gamma": args.confidence_gamma,
         "memory_grid_resolution": list(args.memory_grid_resolution),
         "memory_stride": args.memory_stride,
         "memory_splat_radius": args.memory_splat_radius,
