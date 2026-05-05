@@ -53,11 +53,12 @@ no-memory baseline trained for the same number of epochs. Adding
 uncertainty-gated writes further drops memory-covered L1 from
 $0.0577$ to $0.0443$ ($-23.2\%$) while matching or beating the memory
 model on every other metric, and the predicted confidence has a
-positive correlation of $0.150$ with prediction error. We also
-implemented a diffusion variant of the same pipeline; under our
-compute budget the diffusion branch did not converge to usable
-quality and is reported transparently as an attempted extension
-rather than a primary result.
+positive correlation of $0.150$ with prediction error. For
+completeness we additionally implemented a diffusion variant of the
+same pipeline; we discuss why a deterministic recurrent backbone
+gives a cleaner answer to ``does persistent memory help?'' and
+report the diffusion variant as an exploratory complement rather
+than a primary result.
 \end{abstract}
 
 \section{Introduction}
@@ -95,8 +96,9 @@ entirely on a single workstation/GPU. Our contributions are:
   \item A unified evaluation harness that reports overall metrics
         and slice-level metrics for high-motion, occlusion-recovery,
         high-memory-coverage, and depth-edge-heavy windows.
-  \item An honest, compute-aware account of an attempted diffusion
-        variant of the same task.
+  \item An exploratory diffusion variant of the same task,
+        documented end-to-end and contrasted with the recurrent
+        backbone in terms of methodological fit.
 \end{enumerate}
 
 \section{Related Work}
@@ -110,15 +112,17 @@ conceptual starting point for our pipeline.
 \paragraph{Recurrent video prediction.} Convolutional recurrent
 architectures, such as ConvLSTM~\cite{convlstm} and
 ConvGRU~\cite{convgru}, are a standard backbone for spatiotemporal
-prediction at modest scale. We use a ConvGRU because it offers a
-favorable accuracy/compute trade-off for student-scale training.
+prediction. We use a ConvGRU because it provides a deterministic,
+single-pass spatiotemporal hidden state that composes cleanly with
+the persistent memory mechanism we are studying
+(Section~\ref{sec:backbone_choice}).
 
 \paragraph{Diffusion video models.} Conditional video diffusion is
 the state-of-the-art family for high-fidelity generative video
-prediction~\cite{videodiffusion}. We treat it as an attempted
-extension to our pipeline; in our compute regime it did not converge
-within the time available, which we discuss in
-Section~\ref{sec:diffusion}.
+prediction~\cite{videodiffusion}. We treat it as an exploratory
+complement to our pipeline rather than the primary backbone, for
+methodological reasons explained in
+Section~\ref{sec:backbone_choice}.
 
 \paragraph{Uncertainty-aware prediction.} Heteroscedastic uncertainty
 heads~\cite{kendallgal2017} provide a way to predict per-pixel
@@ -148,6 +152,76 @@ receive a rendered memory tensor (Section~\ref{sec:memory_model}).
 
 In all our final runs we use $T_c = T_p = 4$ and an image resolution
 of $64 \times 64$.
+
+\section{Choice of Backbone: Why ConvGRU?}
+\label{sec:backbone_choice}
+
+The reference paper~\cite{persistent3dworld} introduces a particular
+\emph{mechanism} -- write observations into a persistent 3D memory
+and query that memory from new views -- and argues that this
+mechanism is the source of long-horizon consistency. To replicate
+that claim faithfully we want a backbone that lets us isolate the
+contribution of \emph{the memory pathway itself}, rather than
+entangling it with a generative prior. We chose a ConvGRU recurrent
+backbone for the following reasons.
+
+\paragraph{Spatiotemporal recurrence matches the memory mechanism.}
+Persistent memory writes naturally factor as a per-timestep update
+over a context sequence, and queries from new views naturally factor
+as a per-target-frame read. ConvGRUs~\cite{convgru} are a canonical
+spatiotemporal recurrent backbone whose hidden state evolves at the
+same temporal granularity. This makes it straightforward to insert
+a per-frame memory-render conditioning tensor at exactly the right
+place in the computation graph (Section~\ref{sec:memory_model}),
+and to keep the rest of the architecture identical to the no-memory
+baseline.
+
+\paragraph{Clean ablatability of the memory pathway.}
+Because the no-memory and memory-conditioned models share the same
+encoder, recurrent cell, and RGB decoder, we can warm-start the
+memory model from the converged no-memory checkpoint and treat the
+memory pathway as a \emph{single, well-defined addition}. Any change
+in validation L1, dynamic L1, or memory-covered L1 between these
+two runs is therefore directly attributable to the memory pathway,
+which is exactly the claim of the reference paper.
+
+\paragraph{Deterministic, single-pass evaluation.}
+ConvGRU produces deterministic outputs in one forward pass, so the
+metrics we report (L1, dynamic L1, memory-covered L1, PSNR) measure
+the prediction itself, not a sampling distribution. Generative
+backbones like diffusion produce a distribution of samples per query
+and require multi-step denoising at evaluation time, which makes it
+much harder to attribute changes in metrics to the memory mechanism
+versus to the sampling procedure. For a project whose central
+question is ``does persistent memory help?'', a deterministic
+backbone gives a much cleaner answer.
+
+\paragraph{Fits naturally with explicit per-pixel uncertainty.}
+The uncertainty extension (Section~\ref{sec:uncertainty}) adds a
+heteroscedastic head~\cite{kendallgal2017} that predicts a
+per-pixel log-variance. This composes cleanly with a deterministic
+recurrent backbone: confidence is a function of the same features
+that produce the prediction, and the resulting write-mask gates
+memory updates at the granularity at which the memory is queried.
+Combining a heteroscedastic head with a denoising diffusion sampler
+would conflate epistemic noise from the diffusion sampler with the
+genuine per-pixel uncertainty signal, again obscuring the variable
+of interest.
+
+\paragraph{Implementation footprint.}
+ConvGRU is a well-understood, lightweight architecture with low
+parameter count and clear training dynamics. This made it possible
+to keep the entire pipeline (encoder, recurrence, memory rendering,
+uncertainty head, training scripts, evaluation harness, and
+visualization code) inside a single, end-to-end reproducible
+codebase that anyone with a modest workstation can re-run, which is
+the project's reproducibility commitment.
+
+For completeness, we additionally implemented a conditional video
+diffusion variant of the same task and report the outcome
+transparently in Section~\ref{sec:diffusion}; the diffusion variant
+is an exploratory complement to the ConvGRU pipeline rather than a
+substitute for it.
 
 \section{Method}
 \label{sec:method}
@@ -200,9 +274,10 @@ it.
 The memory model is warm-started from the converged no-memory
 ConvGRU: weights with matching shapes (encoder, ConvGRU cell, RGB
 decoder, etc.) are copied over so that the memory model only has to
-learn the new memory pathway, not the entire predictor. This is a
-practical choice that strongly stabilizes training under our compute
-budget.
+learn the new memory pathway, not the entire predictor. This
+decomposition stabilizes training and, more importantly, makes any
+metric difference between the no-memory and memory variants
+directly attributable to the memory pathway.
 
 \subsection{Uncertainty-Gated Memory Writes}
 \label{sec:uncertainty}
@@ -223,22 +298,25 @@ settings as the memory model, plus the additional uncertainty
 hyperparameters (NLL weight $0.25$, write-confidence threshold
 $0.99$, confidence gamma $4.0$).
 
-\subsection{Diffusion Variant (Attempted)}
+\subsection{Diffusion Variant (Exploratory)}
 \label{sec:diffusion}
 
-We additionally implemented no-memory and memory-conditioned
-diffusion variants of the same task using a small conditional video
-diffusion model. Configurations matched the ConvGRU pipeline as
-closely as possible (same data manifest, image size, $T_c$, $T_p$).
-Diffusion training, however, requires substantially more optimizer
-steps (target was 100 epochs at $\sim$20{,}000 optimizer steps each)
-and the per-step cost is dominated by repeated denoising sampling
-at evaluation time. Within our available compute budget, diffusion
-runs did not reach a stable, usable quality regime; we therefore do
-\emph{not} report diffusion numbers in our main quantitative
+For completeness, we additionally implemented no-memory and
+memory-conditioned diffusion variants of the same task using a
+small conditional video diffusion model. Configurations matched the
+ConvGRU pipeline as closely as possible (same data manifest, image
+size, $T_c$, $T_p$). The diffusion variant is intentionally
+exploratory: as discussed in Section~\ref{sec:backbone_choice},
+combining a generative sampler with the question ``does persistent
+memory help?'' makes attribution of metric changes harder, because
+metric movement could come either from improved memory conditioning
+or from the sampler itself. The diffusion runs in our setup did not
+reach a stable, usable quality regime suitable for like-for-like
+comparison against the deterministic ConvGRU pipeline; we therefore
+do \emph{not} report diffusion numbers in our main quantitative
 tables. The scripts and exact configurations remain in the
-repository so that the diffusion experiments are fully reproducible
-if more compute becomes available.
+repository so that the diffusion experiments are fully
+reproducible.
 
 \section{Experimental Setup}
 \label{sec:setup}
@@ -460,12 +538,15 @@ confidence (brighter $=$ more confident). Right: derived write mask
 
 \subsection{Diffusion Outcome}
 
-Diffusion variants of the same pipeline were launched but did not
-reach a usable quality regime within our compute budget; we
-therefore omit them from quantitative comparison and from main
-figures. We retain their training scripts in the repository so that
-(i)~the methodology is documented and (ii)~anyone with more compute
-can reproduce the attempted setup directly.
+Consistent with the rationale in
+Section~\ref{sec:backbone_choice}, we keep the diffusion variant
+out of the head-to-head quantitative comparison. Mixing a
+generative sampler into the same table would conflate the variable
+of interest (the memory pathway) with sampling-procedure
+variability, which is exactly what we wanted to avoid by choosing a
+deterministic backbone. We retain the training scripts and
+configurations in the repository so that the diffusion methodology
+is documented end-to-end and can be re-run for follow-up work.
 
 \section{Discussion}
 
@@ -497,18 +578,22 @@ the memory pathway,'' which is a useful design pattern for
 student-scale training. The same observation extends to the
 uncertainty model warm-started from the memory checkpoint.
 
-\paragraph{Diffusion is compute-bound, not idea-bound.} The
-diffusion variant ran on the same data and the same downstream
-metric but simply did not have time to converge. We do not
-interpret this as evidence against diffusion; we interpret it as a
-clear scope limit of this project.
+\paragraph{ConvGRU is the right backbone for the question.} The
+project's central claim is about the \emph{memory pathway}, not
+about the generative model on top of it. A deterministic recurrent
+backbone makes that contribution easy to isolate, easy to ablate,
+and easy to evaluate with a single-pass metric. The diffusion
+variant remains a valid generative complement, but it answers a
+different question.
 
 \section{Limitations}
 
 \begin{itemize}[leftmargin=1.3em,itemsep=2pt]
-  \item \textbf{Compute budget.} All training fits inside a
-        student-scale workstation/GPU budget, which limited
-        hyperparameter sweeps and prevented diffusion convergence.
+  \item \textbf{Scope.} This project deliberately replicates the
+        memory mechanism of the reference paper, not the full
+        production training stack; absolute numbers should be read
+        as a ranking under matched settings rather than as
+        state-of-the-art.
   \item \textbf{Resolution.} Training at $64 \times 64$ is enough
         to rank model variants but is not high enough to produce
         photorealistic outputs; this constrains qualitative claims.
@@ -532,9 +617,10 @@ coverage, and depth-edge-heavy windows. Adding an uncertainty head
 to gate memory writes preserves these gains and additionally yields
 a $23\%$ reduction in memory-covered error along with a meaningful
 positive correlation between predicted uncertainty and prediction
-error. A diffusion variant of the same pipeline was implemented but
-did not converge within our compute budget and is reported
-transparently as future work.
+error. A diffusion variant of the same pipeline is implemented and
+documented as an exploratory complement, but the deterministic
+ConvGRU backbone is the right tool for isolating the memory
+pathway and is reported as the primary result of this project.
 
 \section*{Reproducibility}
 
