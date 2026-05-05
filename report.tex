@@ -12,6 +12,8 @@
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{caption}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,calc,backgrounds}
 
 \hypersetup{
   colorlinks=true,
@@ -226,6 +228,87 @@ substitute for it.
 \section{Method}
 \label{sec:method}
 
+\subsection{Architecture Overview}
+\label{sec:arch_overview}
+
+Figure~\ref{fig:architecture} shows the unified ConvGRU-based
+architecture used by all three model variants. Solid arrows denote
+forward computation; the dashed arrow denotes the
+uncertainty-gated memory-update path used only by the uncertainty
+variant. The no-memory baseline removes the entire 3D-memory
+branch and the memory-encoder/fuse path; the memory variant uses
+all solid arrows; the uncertainty variant additionally uses the
+heteroscedastic head and the dashed write-gating loop.
+
+\begin{figure}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=10mm and 14mm,
+  every node/.style={font=\small},
+  blk/.style={rectangle, draw, rounded corners=2pt,
+              minimum width=24mm, minimum height=8mm,
+              align=center, fill=blue!5},
+  memblk/.style={rectangle, draw, rounded corners=2pt,
+                 minimum width=24mm, minimum height=8mm,
+                 align=center, fill=orange!10},
+  outblk/.style={rectangle, draw, rounded corners=2pt,
+                 minimum width=24mm, minimum height=8mm,
+                 align=center, fill=green!10},
+  inblk/.style={rectangle, draw, rounded corners=2pt,
+                minimum width=24mm, minimum height=8mm,
+                align=center, fill=gray!10},
+  flowarrow/.style={-{Latex[length=2mm]}, thick},
+  gatearrow/.style={-{Latex[length=2mm]}, thick, dashed, red!70!black}
+]
+\node[inblk]                                (ctx)    {Context $\{I_t,P_t,D_t\}_{t=1}^{T_c}$};
+\node[blk,    right=of ctx]                 (enc)    {Image\\Encoder $E$};
+\node[blk,    right=of enc]                 (gru)    {ConvGRU\\cell};
+\node[blk,    right=of gru]                 (fuse)   {Fuse\\$1\!\times\!1$ conv};
+\node[blk,    right=of fuse]                (gru2)   {ConvGRU\\update};
+\node[outblk, right=of gru2]                (drgb)   {RGB\\Decoder $D_{\text{rgb}}$};
+\node[outblk, above=6mm of drgb]            (ddepth) {Depth\\Decoder $D_d$};
+\node[outblk, below=6mm of drgb]            (dunc)   {Uncertainty\\Head $U$};
+\node[memblk, below=18mm of ctx]            (vox)    {Build 3D\\Voxel Memory $\mathcal{M}$};
+\node[memblk, below=18mm of gru]            (rend)   {Render at\\target pose $P_t$};
+\node[memblk, below=18mm of fuse]           (menc)   {Memory\\Encoder $E_m$};
+\node[blk,    below=18mm of gru2]           (pose)   {Pose\\Features $\phi$};
+
+\draw[flowarrow] (ctx)   -- (enc);
+\draw[flowarrow] (enc)   -- (gru);
+\draw[flowarrow] (gru)   -- node[above]{$h_{T_c}$} (fuse);
+\draw[flowarrow] (fuse)  -- (gru2);
+\draw[flowarrow] (gru2)  -- (drgb);
+\draw[flowarrow] (gru2)  |- (ddepth);
+\draw[flowarrow] (gru2)  |- (dunc);
+
+\draw[flowarrow] (ctx)   -- (vox);
+\draw[flowarrow] (vox)   -- (rend);
+\draw[flowarrow] (rend)  -- (menc);
+\draw[flowarrow] (menc)  -- (fuse);
+
+\draw[flowarrow] (pose)  -- (fuse);
+
+\node[right=2mm of drgb,align=left,anchor=west]   (rgbout) {$\hat I_t$};
+\node[right=2mm of ddepth,align=left,anchor=west] (dout)   {$\hat D_t$};
+\node[right=2mm of dunc,align=left,anchor=west]   (uout)   {$\log\sigma_t^2$};
+
+\draw[gatearrow] (dunc.south) ..
+  controls +(0,-10mm) and +(20mm,-15mm) ..
+  node[below right]{write mask $w_t$} (vox.east);
+
+\end{tikzpicture}%
+}
+\caption{Unified architecture used by all three ConvGRU variants.
+Top row: image encoder, recurrent ConvGRU cell, fusion block, and
+prediction heads (RGB, depth, and -- for the uncertainty variant
+-- a heteroscedastic head). Bottom row: persistent 3D voxel memory
+$\mathcal{M}$, target-view render, and memory encoder. The dashed
+red path is the uncertainty-gated write loop used only by the
+uncertainty variant.}
+\label{fig:architecture}
+\end{figure}
+
 \subsection{Data Pipeline}
 
 We export MOVi-A clips into compressed \texttt{.npz} shards
@@ -297,6 +380,155 @@ memory-conditioned ConvGRU. We follow the same data and optimization
 settings as the memory model, plus the additional uncertainty
 hyperparameters (NLL weight $0.25$, write-confidence threshold
 $0.99$, confidence gamma $4.0$).
+
+\subsection{Formal Specification}
+\label{sec:formal}
+
+This subsection states precisely what every variant computes and
+the exact loss it minimises, so the entire pipeline is reproducible
+from equations.
+
+\paragraph{Notation.}
+Let $T_c$ and $T_p$ be context and prediction lengths, $H{=}W{=}64$
+the image side, and $K$ the camera intrinsics. For each window we
+have context frames $I_{1:T_c} \in \mathbb{R}^{T_c \times 3 \times
+H \times W}$, depths $D_{1:T_c} \in \mathbb{R}^{T_c \times H \times
+W}$, context poses $P_{1:T_c}$, and target poses
+$P_{T_c+1:T_c+T_p}$, all in $\mathrm{SE}(3)$.
+
+\paragraph{Encoder and recurrence.}
+Each image is encoded by a small convolutional encoder
+$E:\mathbb{R}^{3\times H\times W}\to\mathbb{R}^{C\times h\times w}$
+(with $C=128$). The context hidden state is computed by a ConvGRU
+cell~\cite{convgru} iterated over the context:
+\begin{align}
+e_t &= E(I_t), \\
+z_t &= \sigma\!\bigl(W_z * [e_t, h_{t-1}]\bigr), \\
+r_t &= \sigma\!\bigl(W_r * [e_t, h_{t-1}]\bigr), \\
+\tilde{h}_t &= \tanh\!\bigl(W_h * [e_t, r_t \odot h_{t-1}]\bigr), \\
+h_t &= (1 - z_t)\odot h_{t-1} + z_t \odot \tilde h_t,
+\end{align}
+where $*$ denotes 2D convolution with reset gate $r_t$ and update
+gate $z_t$, and $\odot$ is elementwise product. We unroll this for
+$t=1,\ldots,T_c$ to obtain $h_{T_c}$.
+
+\paragraph{Pose features.}
+Given an anchor pose $P_a$ (the last context pose) and a target
+pose $P_t$, we form a relative-pose vector
+\begin{equation}
+\phi(P_a, P_t) = \mathrm{vec}\!\bigl( (P_a^{-1} P_t)_{[:3,:4]} \bigr)
+\;\in\; \mathbb{R}^{12},
+\end{equation}
+and project it through a two-layer MLP, then broadcast to a
+spatial map of shape $C\times h\times w$.
+
+\paragraph{Persistent 3D memory (memory variants).}
+We build a voxelised memory $\mathcal{M}$ on a regular grid of
+resolution $48\times40\times48$. The memory is constructed by
+unprojecting context RGB-D into world coordinates and splatting:
+\begin{equation}
+\mathbf{X}_{t,p} = P_t \, K^{-1}
+\bigl[u_p, v_p, 1\bigr]^\top D_t(u_p, v_p),
+\qquad
+\mathcal{M} \leftarrow \mathrm{Splat}\!\bigl(
+\{(\mathbf{X}_{t,p}, I_t(u_p,v_p))\}_{t,p}\bigr).
+\end{equation}
+For each target pose $P_t$ the memory is rendered into a
+target-view conditioning tensor $R_t$ together with a coverage
+mask $m^{\mathcal{M}}_t \in \{0,1\}^{H\times W}$ (true where
+$\mathcal{M}$ projects to a non-empty pixel) and a rendered depth.
+The memory encoder $E_m$ produces a feature map of the same shape
+as $E(I)$, allowing direct fusion.
+
+\paragraph{Memory-conditioned ConvGRU update.}
+At each prediction step $t \in \{T_c+1,\ldots,T_c+T_p\}$ the model
+fuses the previous-frame latent, the memory-render latent, and the
+pose embedding through a $1\!\times\!1$ convolution and steps the
+ConvGRU once more:
+\begin{align}
+g_t &= \mathrm{Conv}_{1\times1}\!\bigl(
+  [\,E(\hat I_{t-1}),\, E_m(R_t),\, \phi(P_a,P_t)\,]\bigr),
+\quad
+h_t = \mathrm{ConvGRU}(g_t, h_{t-1}), \\
+\hat I_t &= \mathrm{clip}_{[0,1]}\!\bigl(
+\hat I_{t-1} + \alpha\,\tanh\!\bigl(D_{\text{rgb}}(h_t)\bigr)\bigr),
+\qquad
+\hat D_t = \mathrm{ReLU}\!\bigl(D_d(h_t)\bigr),
+\end{align}
+with residual scale $\alpha = 0.25$. We start from
+$\hat I_{T_c} := I_{T_c}$. The no-memory baseline is the same
+recurrence with $E_m(R_t)$ removed and a sum-fusion of $E(\hat
+I_{t-1})$ and the pose map.
+
+\paragraph{Heteroscedastic head and write gating.}
+The uncertainty variant adds a head $U$ that predicts a per-pixel
+log-variance, clipped for stability:
+\begin{equation}
+\log \sigma_t^2 \;=\; \mathrm{clip}\!\bigl( U(h_t),\,
+\ell_{\min},\,\ell_{\max}\bigr).
+\end{equation}
+A confidence map and a binary write mask are derived as
+\begin{equation}
+c_t = \frac{e^{-\log\sigma_t^2}}{1 + e^{-\log\sigma_t^2}},
+\qquad
+\tilde c_t = c_t^{\gamma},
+\qquad
+w_t = \mathbb{1}\!\bigl[\tilde c_t \ge \tau\bigr],
+\end{equation}
+with confidence-gamma $\gamma = 4$ and write-confidence threshold
+$\tau = 0.99$. Memory writes during rollout use $w_t$ as a
+gating mask so that low-confidence pixels do not contaminate
+$\mathcal{M}$.
+
+\paragraph{Dynamic and memory-covered masks.}
+Two evaluation/training masks are derived from the inputs:
+\begin{align}
+m^{\text{dyn}}_t(u,v) &=
+\mathbb{1}\!\bigl[
+  \tfrac{1}{3}\textstyle\sum_c
+  |I_t(c,u,v) - I_{T_c}(c,u,v)| > \theta\bigr], \\
+m^{\mathcal{M}}_t(u,v) &= \text{(memory-render coverage mask)},
+\end{align}
+with motion threshold $\theta = 0.03$.
+
+\paragraph{Composite training loss.}
+For a window we minimise
+\begin{align}
+\mathcal{L}_{\text{rgb}} &= \tfrac{1}{T_p HW}\textstyle\sum_{t,c,u,v}
+|I_t - \hat I_t|, \\
+\mathcal{L}_{\text{dyn}} &= \mathrm{MaskedL1}(\hat I, I; m^{\text{dyn}}), \\
+\mathcal{L}_{\text{depth}} &= \mathrm{MaskedL1}(\hat D, D; \mathbb{1}[D>0]), \\
+\mathcal{L}_{\mathcal{M}} &= \mathrm{MaskedL1}(\hat I, I; m^{\mathcal{M}}), \\
+\mathcal{L}_{\text{NLL}} &=
+\tfrac{1}{T_p HW}\textstyle\sum_{t,u,v}
+\Bigl[\tfrac{1}{2}e^{-\log\sigma_t^2}\,\bar{\delta}_t^2
++ \tfrac{1}{2}\log\sigma_t^2\Bigr],
+\quad
+\bar{\delta}_t^2 = \tfrac{1}{3}\textstyle\sum_c (\hat I_t - I_t)^2,
+\\
+\mathcal{L}_{\text{total}} &=
+\mathcal{L}_{\text{rgb}}
++ \lambda_{\text{dyn}}\mathcal{L}_{\text{dyn}}
++ \lambda_{\text{depth}}\mathcal{L}_{\text{depth}}
++ \lambda_{\mathcal{M}}\mathcal{L}_{\mathcal{M}}
++ \lambda_{\text{NLL}}\mathcal{L}_{\text{NLL}}.
+\end{align}
+We use $\lambda_{\text{dyn}}=3$, $\lambda_{\text{depth}}=0.1$
+(memory variants), $\lambda_{\mathcal{M}}=1$ (memory variants), and
+$\lambda_{\text{NLL}}=0.25$ (uncertainty variant). The no-memory
+baseline keeps only $\mathcal{L}_{\text{rgb}}$ and
+$\mathcal{L}_{\text{dyn}}$.
+
+\paragraph{Evaluation metrics.}
+For evaluation we additionally compute PSNR
+$=-10\log_{10} \mathrm{MSE}$, the dynamic and memory-covered L1
+above, and the per-window correlation between predicted
+uncertainty and per-pixel error,
+\begin{equation}
+\rho_{u,e} \;=\; \mathrm{corr}\!\bigl(\,
+\log\sigma_t^2 ,\, \bar{\delta}_t^2\,\bigr),
+\end{equation}
+together with a write-coverage statistic $\mathbb{E}[w_t]$.
 
 \subsection{Diffusion Variant (Exploratory)}
 \label{sec:diffusion}
