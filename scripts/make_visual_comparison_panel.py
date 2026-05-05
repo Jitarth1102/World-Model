@@ -60,6 +60,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-splat-radius", type=int, default=1)
     parser.add_argument("--uncertainty-label", default="convgru_uncertainty")
     parser.add_argument("--failure-label", default="diffusion_memory")
+    parser.add_argument(
+        "--skip-failure-case",
+        action="store_true",
+        help="Do not include the highest-error window (often ugly); better for slides/report aesthetics.",
+    )
+    parser.add_argument(
+        "--strip-scale",
+        type=int,
+        default=4,
+        help="Integer upscale for strips before layout (LANCZOS). Training is still at --image-size; this only affects exported PNGs.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/final_visual_comparisons_scaled_v1"))
     return parser.parse_args()
@@ -122,6 +133,13 @@ def tensor_strip_to_image(tensor: torch.Tensor) -> Image.Image:
 def render_blank_strip(width: int, height: int) -> Image.Image:
     canvas = Image.new("RGB", (width, height), color=(20, 20, 20))
     return canvas
+
+
+def upscale_strip(image: Image.Image, scale: int) -> Image.Image:
+    if scale <= 1:
+        return image
+    w, h = image.size
+    return image.resize((w * scale, h * scale), Image.Resampling.LANCZOS)
 
 
 def build_dataset(args: argparse.Namespace) -> MemoryConditionedClipWindowDataset:
@@ -279,11 +297,15 @@ def build_panel(
     raw_sample: dict[str, Any],
     predictions: dict[str, dict[str, torch.Tensor]],
     output_path: Path,
+    strip_scale: int = 1,
 ) -> None:
-    font = load_font(16)
+    title_size = min(12 + 3 * strip_scale, 36)
+    subtitle_size = min(10 + 2 * strip_scale, 22)
+    row_label_size = min(14 + 2 * strip_scale, 28)
+    font = load_font(title_size)
     rows: list[tuple[str, Image.Image]] = []
-    context_strip = tensor_strip_to_image(raw_sample["context_rgb"])
-    target_strip = tensor_strip_to_image(raw_sample["target_rgb"])
+    context_strip = upscale_strip(tensor_strip_to_image(raw_sample["context_rgb"]), strip_scale)
+    target_strip = upscale_strip(tensor_strip_to_image(raw_sample["target_rgb"]), strip_scale)
     strip_width, strip_height = context_strip.size
     rows.append(("Context", context_strip))
     rows.append(("Ground Truth", target_strip))
@@ -298,26 +320,31 @@ def build_panel(
     ]
     for label, key in ordered_rows:
         if key in predictions:
-            rows.append((label, tensor_strip_to_image(predictions[key]["prediction"])))
+            rows.append((label, upscale_strip(tensor_strip_to_image(predictions[key]["prediction"]), strip_scale)))
     if "convgru_uncertainty" in predictions:
-        rows.append(("Uncertainty Map", tensor_strip_to_image(predictions["convgru_uncertainty"]["uncertainty"])))
-        rows.append(("Write Mask", tensor_strip_to_image(predictions["convgru_uncertainty"]["write_mask"])))
+        rows.append(
+            ("Uncertainty Map", upscale_strip(tensor_strip_to_image(predictions["convgru_uncertainty"]["uncertainty"]), strip_scale))
+        )
+        rows.append(
+            ("Write Mask", upscale_strip(tensor_strip_to_image(predictions["convgru_uncertainty"]["write_mask"]), strip_scale))
+        )
 
-    label_width = 190
-    header_height = 42
-    gap = 6
+    label_width = max(190, 44 + 14 * strip_scale)
+    header_height = max(42, 18 + title_size + subtitle_size)
+    gap = max(6, strip_scale * 2)
     panel_width = label_width + strip_width
     panel_height = header_height + len(rows) * (strip_height + gap)
     canvas = Image.new("RGB", (panel_width, panel_height), color=(248, 246, 240))
     draw = ImageDraw.Draw(canvas)
-    draw.text((12, 10), f"{case.name}: {Path(case.clip_path).name} @ frame {case.start_frame}", fill=(20, 20, 20), font=font)
-    draw.text((12, 24), case.reason, fill=(90, 90, 90), font=load_font(12))
+    draw.text((12, 8), f"{case.name}: {Path(case.clip_path).name} @ frame {case.start_frame}", fill=(20, 20, 20), font=font)
+    draw.text((12, 8 + title_size), case.reason, fill=(90, 90, 90), font=load_font(subtitle_size))
 
     y = header_height
+    row_font = load_font(row_label_size)
     for label, row_image in rows:
         row_canvas = Image.new("RGB", (panel_width, strip_height), color=(248, 246, 240))
         row_draw = ImageDraw.Draw(row_canvas)
-        row_draw.text((12, strip_height // 2 - 8), label, fill=(20, 20, 20), font=font)
+        row_draw.text((12, max(0, strip_height // 2 - row_label_size // 2)), label, fill=(20, 20, 20), font=row_font)
         row_canvas.paste(row_image, (label_width, 0))
         canvas.paste(row_canvas, (0, y))
         y += strip_height + gap
@@ -341,6 +368,8 @@ def main() -> None:
         uncertainty_label=args.uncertainty_label,
         failure_label=args.failure_label,
     )
+    if args.skip_failure_case:
+        cases = [c for c in cases if c.name != "failure_case"]
 
     specs = OrderedDict((label, build_spec(label, variant, run_dir)) for label, (variant, run_dir) in run_mapping.items())
     models = OrderedDict((label, _load_model(spec, device)) for label, spec in specs.items())
@@ -361,6 +390,7 @@ def main() -> None:
             raw_sample=raw_sample,
             predictions=predictions,
             output_path=case_dir / "panel.png",
+            strip_scale=max(1, args.strip_scale),
         )
         (case_dir / "metadata.json").write_text(
             json.dumps(

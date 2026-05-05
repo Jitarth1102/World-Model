@@ -15,15 +15,12 @@ DEFAULT_RUNS = OrderedDict(
         ("memory_baseline", Path("outputs/train_memory_real_movia_subset50_v1")),
         ("memory_strengthened", Path("outputs/train_memory_real_movia_subset50_v3")),
         ("memory_uncertainty_convgru", Path("outputs/train_memory_uncertainty_real_movia_subset50_v1")),
-        ("diffusion_no_memory", Path("outputs/train_diffusion_nomemory_real_movia_subset50_v1")),
-        ("diffusion_memory", Path("outputs/train_diffusion_memory_real_movia_subset50_v1")),
-        ("diffusion_memory_uncertainty", Path("outputs/train_diffusion_memory_uncertainty_real_movia_subset50_v1")),
     ]
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Summarize experiment metrics across no-memory, memory, and uncertainty variants.")
+    parser = argparse.ArgumentParser(description="Summarize experiment metrics across ConvGRU no-memory, memory, and uncertainty variants.")
     parser.add_argument(
         "--run",
         action="append",

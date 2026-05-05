@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-uncertainty", action="store_true")
     parser.add_argument("--uncertainty-samples", type=int, default=4)
     parser.add_argument("--write-confidence-threshold", type=float, default=0.55)
+    parser.add_argument("--confidence-gamma", type=float, default=1.0)
     parser.add_argument("--motion-threshold", type=float, default=0.03)
     parser.add_argument("--memory-grid-resolution", type=int, nargs=3, default=(48, 40, 48))
     parser.add_argument("--memory-stride", type=int, default=1)
@@ -161,6 +162,7 @@ def main() -> None:
             confidence_threshold=args.write_confidence_threshold,
             sample_steps=sample_steps,
             uncertainty_samples=args.uncertainty_samples,
+            confidence_gamma=args.confidence_gamma,
         )
         window = rollout["window"]
         context_rgb = window.context_rgb.to(device)

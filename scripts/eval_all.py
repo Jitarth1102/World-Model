@@ -14,7 +14,6 @@ DEFAULT_RUNS = OrderedDict(
         ("memory_baseline", ("memory", Path("outputs/train_memory_real_movia_subset50_v1"))),
         ("memory_strengthened", ("memory", Path("outputs/train_memory_real_movia_subset50_v3"))),
         ("memory_uncertainty_convgru", ("memory_uncertainty_convgru", Path("outputs/train_memory_uncertainty_real_movia_subset50_v1"))),
-        ("diffusion_memory_uncertainty", ("diffusion_memory_uncertainty", Path("outputs/train_diffusion_memory_uncertainty_real_movia_subset50_v1"))),
     ]
 )
 
@@ -25,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         "--run",
         action="append",
         default=[],
-        help="Override default runs with LABEL=VARIANT:PATH. Variants: no_memory, memory, memory_uncertainty_convgru, diffusion_no_memory, diffusion_memory, diffusion_memory_uncertainty.",
+        help="Override default runs with LABEL=VARIANT:PATH. Variants: no_memory, memory, memory_uncertainty_convgru.",
     )
     parser.add_argument("--manifest", type=Path, default=Path("data/processed/movi_a_128_subset50/manifest.json"))
     parser.add_argument("--context-frames", type=int, default=4)

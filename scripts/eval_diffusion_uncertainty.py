@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-steps", type=int, default=25)
     parser.add_argument("--uncertainty-samples", type=int, default=4)
     parser.add_argument("--write-confidence-threshold", type=float, default=0.55)
+    parser.add_argument("--confidence-gamma", type=float, default=1.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/train_diffusion_memory_uncertainty_real_movia_subset50_v1"))
     return parser.parse_args()
@@ -192,6 +193,7 @@ def main() -> None:
             confidence_threshold=args.write_confidence_threshold,
             sample_steps=args.sample_steps,
             uncertainty_samples=args.uncertainty_samples,
+            confidence_gamma=args.confidence_gamma,
         )
         window_tensors = rollout["window"]
         context_rgb = window_tensors.context_rgb
@@ -272,6 +274,7 @@ def main() -> None:
         "sample_steps_eval": args.sample_steps,
         "uncertainty_samples": args.uncertainty_samples,
         "write_confidence_threshold": args.write_confidence_threshold,
+        "confidence_gamma": args.confidence_gamma,
         "memory_grid_resolution": list(args.memory_grid_resolution),
         "memory_stride": args.memory_stride,
         "memory_splat_radius": args.memory_splat_radius,
